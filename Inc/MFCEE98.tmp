@@ -1,0 +1,16 @@
+#include "modbus.h"
+
+#define COMMAND_SRAM_ADDR    100                                                // Стартовый адрес сохранения содержимого настройки двигателя в ЭНОЗУ
+#define COMMAND_SRAM_LENGTH  (COMMAND_MODBUS_REGNUM*2+2)        // Размер содержимого настроек двигателя в ЭНОЗУ в байтах
+
+#define ENGINE_SRAM_ADDR    200                                                 // Стартовый адрес сохранения содержимого настройки двигателя в ЭНОЗУ
+#define ENGINE_SRAM_LENGTH  (ENGINE_MODBUS_REGNUM*2+2)       // Размер содержимого настроек двигателя в ЭНОЗУ в байтах
+
+#define CONTEXT_SRAM_ADDR    600                                                 // Стартовый адрес сохранения содержимого настройки двигателя в ЭНОЗУ
+#define CONTEXT_SRAM_LENGTH  (CONTEXT_MODBUS_REGNUM*2+2)        // Размер содержимого настроек двигателя в ЭНОЗУ в байтах
+
+void MX_RTC_Init(void);
+void bkpSRAMInit(void);
+void rtcInit(void);
+uint8_t bkpSRAM_Write(uint8_t *src,uint16_t start,uint16_t len);
+uint8_t bkpSRAM_Read(uint8_t *dst,uint16_t start,uint16_t len);

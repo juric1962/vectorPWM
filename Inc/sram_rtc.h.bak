@@ -1,0 +1,82 @@
+#include "modbus.h"
+#include "stm32f4xx_hal.h"
+
+
+//-------------------------------------- SRAM ----------------------------------
+#define TIMESTAMP_SRAM_ADDR   0      // —тартовый адрес сохранени€ временной метки UNIX(since 2000), сохран€етс€ каждый раз при 
+#define TIMESTAMP_SRAM_LENGTH (4+2)  // обновлении времни RTC_UNIX_TIME (4 байта) + (CRC16 MODBUS - 2 байта) 
+//-------------- ћассив событий автоматического запуска ------------------------
+#define FAULT_ARRAY_ADDR      100                                           // —тартовый адрес массива аварийных событий 
+#define FAULT_ARRAY_ITEM_SIZE 12                                            // –азмер записи аварийного событи€ в байтах, sizeof(FAULT_EVENT_STRUCT)                                         
+#define FAULT_ARRAY_LENGTH    (FAULT_ARRAY_ITEM_SIZE*FAULT_ARRAY_ITEM_NUM)
+//-------------------- EVENT LOG -----------------------------------------------
+#define EVENT_LOG_ADDR  500        // —тартовый адрес протокола событий, первые 4 байта - статусные, пишутьс€ в первые 4 байта протокола событий
+#define EVENT_LOG_RECORD_SIZE 10   // –азмер записи в байтах
+#define EVENT_LOG_RECORDS_NUM 300  //  оличество записей
+
+#define TIMESTAMP_READ_ERROR    1
+#define TURN_OFF_TIME           2
+#define HSE_INIT_ERROR          3 
+#define RTC_INIT_ERROR          4         
+#define RTC_DEFAULTS_SET        5 
+#define ENGINE_DEFAULTS_SET     6
+#define CONTEXT_DEFAULTS_SET    7
+#define COMMAND_DEFAULTS_SET    8
+#define ALARMS_DEFAULTS_SET     9
+#define FAULTS_DEFAULTS_SET     10  // ѕересчитать !!!
+#define ETR_DEFAULTS_SET       10
+#define TEMP_SENS1_INIT_ERROR  11
+#define TEMP_SENS2_INIT_ERROR  12
+#define TEMP_SENS1_NO_RESPONSE 13
+#define TEMP_SENS2_NO_RESPONSE 14
+#define TEMP_SENS1_CRC_ERROR   15
+#define TEMP_SENS2_CRC_ERROR   16
+#define TURN_ON_TIME           17
+#define BRIDGE_SATURATION_LOG  18 // Ќасыщение одного из полумостов (value = 1.0 - канал ј, 2.0 - канал B, 3.0 - канал —)
+#define UDC_OVERVOLTAGE        19
+#define INST_A_OVERCURRENT     20
+#define INST_B_OVERCURRENT     21
+#define INST_C_OVERCURRENT     22
+#define RMS_OVERCURRENT        23
+#define ETR_OVERLOAD           24
+#define BREAK_I_A              25
+#define BREAK_I_B              26
+#define BREAK_I_C              27
+#define CURRENT_DISBALANCE     28
+#define TEMP_SENS1_ALARM       39
+#define TEMP_SENS2_ALARM       30
+#define LOW_VOLTAGE_ALARM      31
+#define FIX_FREQ_ON            32
+#define FIX_FREQ_OFF           33
+#define NO_LOAD_ALARM          34
+//------------------------------------------------------------------------------
+typedef struct{ 
+  uint16_t ptr;
+  uint16_t totalEventsNum;  
+  uint16_t code;
+  float value;
+  uint32_t unixTime;   
+}EVENT_LOG_STRUCT;
+extern volatile EVENT_LOG_STRUCT eventLog;
+void eventLogInit(void);
+void eventLogWrite(uint8_t eventCode,float value,uint32_t unixTime);
+
+typedef struct{
+  uint32_t timeStamp;
+  uint16_t CRC16;
+}RTC_UNIX_TIME_STRUCT;
+
+extern RTC_TimeTypeDef  RTC_TimeStructure;
+extern RTC_DateTypeDef RTC_DateStructure; 
+extern volatile RTC_UNIX_TIME_STRUCT RTC_UnixTime;
+extern RTC_HandleTypeDef hrtc; 
+
+void systemTimeUpdate(void);
+void rtcInit(void);
+void getDataTimeTask(void);
+uint32_t toUnix(RTC_DateTypeDef RTC_DateStructure, RTC_TimeTypeDef RTC_TimeStructure);
+void fromUnix(RTC_DateTypeDef *RTC_DateStructure, RTC_TimeTypeDef *RTC_TimeStructure, uint32_t secsarg);
+
+void bkpSRAMInit(void);
+uint8_t bkpSRAM_Write(uint16_t addr,uint8_t *src,uint16_t len);
+uint8_t bkpSRAM_Read(uint16_t addr,uint8_t *dst,uint16_t len);

@@ -1,0 +1,313 @@
+#include "DS18B20.h"
+#include "main.h"
+#include "sram_rtc.h"
+#include "pwm.h"
+#include "alarms.h"
+#include "bvi.h"
+
+volatile TEMP_SENSOR tempSensor[3];
+
+uint8_t DS18B20_Init(void)
+{
+  uint8_t temp; 
+  uint8_t temp2=0;
+  DS18B20_UART4_Init(9600);  
+  temp=0xF0;  
+  HAL_UART_Transmit(&huart4, &temp, 1, 2);  
+  HAL_UART_Receive(&huart4, &temp2, 1, 2);  
+  if(temp2!=0xF0)return 0;
+  else return 1;  
+}
+
+void DS18B20_Read(uint8_t *dst, uint8_t len)
+{
+  uint8_t i,j,temp,input;
+  temp=huart4.Instance->DR; // Очистка мусора
+  input=0xFF;  
+  for(i=0;i<len;i++)
+  {
+    //energyCalcTask(); 
+    //modbusTask();
+    dst[i]=0;
+    for(j=0;j<8;j++)
+    {
+      HAL_UART_Transmit(&huart4, &input, 1, 2);  
+      HAL_UART_Receive(&huart4, &temp, 1, 2);    
+      if(temp==0xFF)dst[i]|=0x01<<j;
+    }      
+  }
+}
+
+void DS18B20_Write(uint8_t *src, uint8_t len)
+{
+  uint8_t i,j,temp;
+  for(i=0;i<len;i++)
+  {      
+    //energyCalcTask();
+    //modbusTask(); 
+    for(j=0;j<8;j++)
+    {
+      if(src[i]&(0x01<<j))temp=0xFF;
+      else temp=0x00;    
+      HAL_UART_Transmit(&huart4, &temp, 1, 2);  
+    } 
+  }
+}
+
+void DS18B20ReadROM(uint8_t *output)
+{
+    uint8_t command=ROM_COMMAND_READ_ROM;
+    DS18B20_UART4_Init(115200);    
+    DS18B20_Write(&command,1);      
+    DS18B20_Read(output,8);
+}
+
+uint8_t crc8( uint8_t *addr, uint8_t len)
+{
+     uint8_t crc=0;
+     
+     for (uint8_t i=0; i<len;i++) 
+     {
+           uint8_t inbyte = addr[i];
+           for (uint8_t j=0;j<8;j++) 
+           {
+                 uint8_t mix = (crc ^ inbyte) & 0x01;
+                 crc >>= 1;
+                 if (mix) crc ^= 0x8C;                 
+                 inbyte >>= 1;
+           }
+     }
+     return crc;
+}
+
+void tempSensorsInit(void) // Инициализация во время включения питания, считывание уникального 64-битного кода
+{
+  uint8_t attempts=5; // Количество попыток, при которых датчик продолжает опрашиваться
+  uint8_t i,n;
+  
+  tempSensor[0].isOn=1; 
+  tempSensor[1].isOn=1; 
+  tempSensor[2].isOn=1; 
+  
+  tempSensor[0].errorNum=0;
+  tempSensor[1].errorNum=0;
+  tempSensor[2].errorNum=0;
+  
+  DS18B20_MUX_A(0);  
+  DS18B20_MUX_B(0);
+  DS18B20_MUX_C(0);
+  
+  for(n=0;n<3;n++)
+  {
+    if(tempSensor[n].isOn)
+    {
+      tempSensor[n].errorCode=0;       
+      switch(n)
+      {
+        case 0:
+          DS18B20_MUX_A(0);
+          DS18B20_MUX_B(0);
+          DS18B20_MUX_C(0);          
+        break;
+        case 1:
+          DS18B20_MUX_A(1);
+          DS18B20_MUX_B(0);
+          DS18B20_MUX_C(0); 
+        break;
+        case 2:
+          DS18B20_MUX_A(0);
+          DS18B20_MUX_B(1);
+          DS18B20_MUX_C(0);           
+        break;        
+      }
+          
+      for(i=0;i<attempts;i++)
+      {
+        tempSensor[n].isOn=1;
+        if(DS18B20_Init())// Датчик не отвечает 
+        {
+          tempSensor[n].errorCode|=0x01;
+          tempSensor[n].errorNum++;
+          tempSensor[n].isOn=0;
+          tempSensor[n].curTemp=-100;
+          diag.tempInitErr++;
+        }else{
+          DS18B20ReadROM((uint8_t*)&tempSensor[n].DS18B20_Code.familyCode); 
+          if(tempSensor[n].DS18B20_Code.CRC8==crc8((uint8_t*)&tempSensor[n].DS18B20_Code.familyCode,7))
+          {
+           break; 
+          }else{
+            tempSensor[n].errorCode|=0x02;
+            tempSensor[n].errorNum++;   
+            tempSensor[n].isOn=0;
+            tempSensor[n].curTemp=-100;
+            diag.tempCRCerr++;
+          }
+        }       
+      }
+    }
+  }
+  if(tempSensor[0].isOn==0)
+  {
+    systemState.eventLogHardwareFault=11; // Ошибка инициализации датчика температуры конденсаторов
+    eventLogWrite(18);
+  }
+  if(tempSensor[1].isOn==0)
+  {
+    systemState.eventLogHardwareFault=12; // Ошибка инициализации датчика температуры конденсаторов
+    eventLogWrite(18);  
+  }
+}
+
+void getTemperatureTask(void)
+{  
+#define attemptsNum85 10
+  uint32_t curTick=HAL_GetTick();    
+  static uint32_t prevTick=0; 
+  uint32_t ms;
+  static uint8_t state=0;
+  uint8_t n;
+  int8_t temp85;      // Датчик температуры во время работы может перезагружаться, 
+  static uint8_t temp85cnt=0;   // Количество считываний температуры равной 85 град. С (это может быть перезагрузкой)
+  static uint8_t radiatorTempError=0;
+     
+  if(curTick>prevTick) 
+  {
+    ms=curTick-prevTick;
+  }else{ms=(0xFFFFFFFFL-prevTick)+(curTick+1L);}
+  
+    if(ms>1000) // Прошла 1 секунда
+    {
+      for(n=0;n<3;n++)
+      {
+        if(tempSensor[n].isOn)
+        {
+          uint8_t command;
+          
+          switch(n)
+          {
+            case 0:
+              DS18B20_MUX_A(0);
+              DS18B20_MUX_B(0);
+              DS18B20_MUX_C(0);          
+            break;
+            case 1:
+              DS18B20_MUX_A(1);
+              DS18B20_MUX_B(0);
+              DS18B20_MUX_C(0); 
+            break;
+            case 2:
+              DS18B20_MUX_A(0);
+              DS18B20_MUX_B(1);
+              DS18B20_MUX_C(0);           
+            break;        
+          }          
+          
+          tempSensor[n].errorCode=0; 
+          if(DS18B20_Init()){// Датчик не отвечает           
+            tempSensor[n].errorCode|=0x01;tempSensor[n].errorNum++;tempSensor[n].curTemp=-100;
+            diag.tempInitErr++;
+            //if(n==0)eventLogWrite(TEMP_SENS1_NO_RESPONSE,0.0f,RTC_UnixTime.timeStamp);  
+            //else eventLogWrite(TEMP_SENS2_NO_RESPONSE,0.0f,RTC_UnixTime.timeStamp);
+          }else{
+            DS18B20_UART4_Init(115200); 
+            if(state)
+            {                 
+              command=ROM_COMMAND_MATCH_ROM;
+              DS18B20_Write(&command,1);              
+              DS18B20_Write((uint8_t*)&tempSensor[n].DS18B20_Code.familyCode,8);               
+              command=ROM_COMMAND_READ_SCRATCHPAD;
+              DS18B20_Write(&command,1);         
+              DS18B20_Read((uint8_t*)&tempSensor[n].scratchPad,9);            
+              if(tempSensor[n].scratchPad[8]==crc8((uint8_t*)&tempSensor[n].scratchPad,8))
+              {
+                temp85=((tempSensor[n].scratchPad[1]<<4)|(tempSensor[n].scratchPad[0])>>4);
+                if(temp85==85)
+                {
+                  temp85cnt++;
+                  if(temp85cnt>attemptsNum85) // Это не ресет!!!
+                  {
+                    temp85cnt=attemptsNum85+1;
+                    tempSensor[n].curTemp=temp85;
+                    diag.tempReadsNum++;                    
+                    if(diag.temp85>attemptsNum85)diag.temp85-=attemptsNum85;
+                  }else{diag.temp85++;}
+                }else{ 
+                  temp85cnt=0;
+                  tempSensor[n].curTemp=temp85;
+                  diag.tempReadsNum++;
+                }
+              }else{
+                tempSensor[n].errorCode|=0x02;
+                tempSensor[n].errorNum++;
+                tempSensor[n].curTemp=-100;
+                //if(n==0)eventLogWrite(TEMP_SENS1_CRC_ERROR,0.0f,RTC_UnixTime.timeStamp);  
+                //else eventLogWrite(TEMP_SENS2_CRC_ERROR,0.0f,RTC_UnixTime.timeStamp);                
+                diag.tempCRCerr++;
+              }                
+            }else{              
+              command=ROM_COMMAND_MATCH_ROM;
+              DS18B20_Write(&command,1);              
+              DS18B20_Write((uint8_t*)&tempSensor[n].DS18B20_Code.familyCode,8);             
+              command=ROM_COMMAND_CONVERT_T;
+              DS18B20_Write(&command,1);                                                                 
+            }
+          }
+        }
+      }
+      if(state)state=0;
+      else state=1;
+      if(vectorPWM.isOn)
+      {
+        if(tempSensor[0].curTemp>=alarms.internalTemperatureMAX)
+        {
+          eventsCnt.temp1++;
+          eventLogWrite(8);
+          DRIVER_STOP(1);          
+          alarms.faultBits|=0x4000;           
+          vectorPWM.outputsCommand=2;                                 
+          systemState.faults=(1L<<TEMP_SENS_FAULT);        
+          //forceBVI(8, 0);
+          FAULT_OPTO_OUT(1);                        
+        }
+        if(tempSensor[1].curTemp>=alarms.radiatorTemperatureMAX)
+        {
+          eventsCnt.temp2++;             
+          eventLogWrite(8);
+          DRIVER_STOP(1);          
+          alarms.faultBits|=0x8000;           
+          vectorPWM.outputsCommand=2;                                 
+          systemState.faults=(1L<<TEMP_SENS_FAULT);        
+          //forceBVI(8, 0);
+          FAULT_OPTO_OUT(1);                
+        }        
+      }        
+      //----------- Управление вентиляторами----------------------------------
+      if(tempSensor[1].curTemp==-100)
+      {          
+        if(radiatorTempError>30) // Последовательные ошибки в течение 30 сек
+        {
+          FAN_ON(1);
+          //DOUT3(1); Управление внешним вентилятором не нужно
+          //stateDOUT|=4;
+        }else radiatorTempError++;         
+      }else{
+        if(tempSensor[1].curTemp>=command.fanOnTemp)
+        {
+          FAN_ON(1);
+          //DOUT3(1); Управление внешним вентилятором не нужно  
+          //stateDOUT|=4;
+        }else{
+          if(tempSensor[1].curTemp<=(command.fanOnTemp-command.fanOnTempHyst))
+          {
+            FAN_ON(0);
+            //DOUT3(0);  Управление внешним вентилятором не нужно  
+            //stateDOUT&=0xFB;
+          }
+        }
+        radiatorTempError=0;
+      }        
+      //----------------------------------------------------------------------      
+      prevTick=curTick;           
+    }           
+}

@@ -1,0 +1,391 @@
+#include <stdint.h>
+#include "stm32f4xx_hal.h"
+
+#define ENGINE_IDLE            0 // Простой двигателя, может быть только при включении и остановке выбегом   
+#define ENGINE_UP              1
+#define ENGINE_DOWN            2
+#define ENGINE_CONTEXT_CHANGE  3
+#define ENGINE_READY           4 // Двигатель вращается, готов к выполнению новой команды, к этому состоянию двигатель переходит после разгона, торможения и смены контекста
+#define ENGINE_STOP            5 // С кнопки или по модбас поступила команда об остановке двигателя
+#define ENGINE_FAULT           6  
+#define ENGINE_FREE_RUN        7
+
+//--------------Для проверки частотника на к.з.---------------------------------
+#define A(a)  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, (GPIO_PinState)a) 
+#define nA(a) HAL_GPIO_WritePin(GPIOE, GPIO_PIN_8, (GPIO_PinState)a) 
+
+#define B(a)  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, (GPIO_PinState)a) 
+#define nB(a) HAL_GPIO_WritePin(GPIOE, GPIO_PIN_10, (GPIO_PinState)a) 
+
+#define C(a)  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_13, (GPIO_PinState)a) 
+#define nC(a) HAL_GPIO_WritePin(GPIOE, GPIO_PIN_12, (GPIO_PinState)a) 
+//------------------------------------------------------------------------------
+
+void PWM_EnableOutputs(TIM_HandleTypeDef *htim);
+void PWM_DisableOutputs(TIM_HandleTypeDef *htim);
+HAL_StatusTypeDef PWM_Start(TIM_HandleTypeDef *htim);
+void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim);
+void TIM_CCxNChannelCmd(TIM_TypeDef* TIMx, uint32_t Channel, uint32_t ChannelNState);
+
+void vectorPWMSetPhi0(void); // При включении или сбое программы установить начальный угол в ноль
+void vectorPWMInit(uint16_t freqPWM);
+void vectorPWMcalc(void);
+inline void adc(void);
+
+typedef struct{  
+  // Modbus Start
+  float desiredFreqOrRPM;// Установка выходной частоты статора/об. в мин       
+  uint16_t voltageStab;  // Режим стабилизации напряжения  
+  uint16_t rotationDIR;  // Направление вращения: 0 - по часовой, 1 - против      
+  uint16_t stopCHREP;    // > 1 Команда останова двигателя в режиме ЧРЭП с верхнего уровня 
+  uint16_t delayBeforeRestartSec; // Задержка на включение после аварии, необходимо для того, чтобы не было генераторного режима (Только в режиме ЧРЭП)  
+  uint16_t delayBeforeStartKPSec;    // Задержка перед пуском в режиме КП
+  uint16_t faultsReset;  // Сброс счетчиков аварий
+  uint16_t autoMode;     // Автономный режим работы: 0 - ЧРЭП, 1 - КП
+  uint16_t testMode;     // Режим теста оборудования: 0 - выкл, 1 - при установке новой частоты - частота устанавливается мгновенно, а напряжение  - исходя из параметров разгона/торможения   
+  int16_t fanOnTemp;     // Температура включения внутренних вентиляторов и ТУ3
+  int16_t fanOnTempHyst; // Гистерезис на выключение внутренних вентиляторов и ТУ3 
+  uint16_t dFMaxCorrection; // Максимально допустимое увеличение частоты в генераторном режиме относительно синхронной частоты, Гц
+  uint16_t pidPrescaler; // Предделитель ПИД-регулятора, используется скользящее окно   
+  float powerStab;       // Стабилизация активной мощности в генераторном режиме, величина мощности в Вт
+  float Kp;              // Пропорциональная составляющая ПИД регулятора 
+  float Ki;              // Интегральная составляющая ПИД-регулятора 
+  float Kd;              // Дифференциальная составляющая ПИД-регулятора 
+  float dphiLimit;       // Ограничение на приращения фазы между соседними тактами ПИД-регулятора  
+  uint16_t voltageStabPowerLow;    // Выключать стабилизацию напряжения при снижении ниже заданной мощности
+  uint16_t voltageStabPowerHigh;   // Включать стабилизацию напряжения при превышении заданной мощности
+  uint16_t startCurrentFreezeLow;  // Разгонный ток, при котором происходит "разморозка" частоты (точки U(f)), действ. знач. А 
+  uint16_t startCurrentFreezeHigh; // Разгонный ток, при котором происходит "заморозка" частоты (точки U(f)), действ. знач. А
+  uint16_t startCurrentFreezeMS;   // Максимальный промежуток времени, на котором происходит заморозка частоты (точки U(f)), мс (0 - режим отключен) 
+  uint16_t powerInsensitiveDelta;  // В диапазоне ошибок регулятора мощности Err=(-powerInsensitiveDelta;powerInsensitiveDelta) - ошибка корректируется Err=0, Вт  
+  uint16_t freeRunUfmax;   // Действующее напряжение для поиска частоты вращающейся по инерции нагрузки, В    
+  uint16_t freeRunTimeMS;  // Ограничение на время поиска частоты вращающейся по инерции нагрузки, мс   (==0 - выкл)      
+  // Modbus End      
+  uint16_t CRC16; 
+  double k1;
+  double k2;  
+  float currentFreqOrRPM; // Текущая выходная частота статора
+  uint8_t updateFromShadow;    
+  float testModeDeltaPhi;
+  uint32_t delayBeforeStartIter;        // Счетчик автозапуска
+  uint32_t beepDelayBeforeStartIter;   
+  uint16_t startCurrentFreezeTimer;
+  uint8_t startCurrentFreezeTrigger;
+  uint8_t freeRunState;
+  //uint8_t state;                
+  //uint8_t vesperMode;   - для работы с веспером - вынести в макрос
+}COMMAND_STRUCT;
+extern volatile COMMAND_STRUCT command, commandShadow;
+
+#define CONTEXT_NUM 10
+typedef struct{
+  float voltagePercent[3];  
+  float freq;          // Задаются три пары {U1,F1}, {U2,F2}, {U3,F3} - при этом F1=minFreq, F3=maxFreq!!! (Настраиваются в структуре engine)
+}UF_TABLE_STRUCT;
+
+typedef struct{		
+  // Start modbus
+  float Inom;                     // Номинальный ток двигателя
+  float Iidle;                    // Ток холостого хода
+  float nomSpeed;                 // Номинальная скорость (об/мин)
+  float nomFreq;                  // Номинальная частота (Гц) 
+  float nomPower;                 // Номинальная мощность 
+  float efficiency;               // КПД двигателя                    
+  float minFreq;                  // Минимально возможная частота установки
+  float maxFreq;                  // Максимально возможная частота установки    
+  //float slipCompensationPercent;  // Процент компенсации скольжения: 0-100% 
+  UF_TABLE_STRUCT ufTable[CONTEXT_NUM];    // Контексты характеристик Напряжение/Частота 
+  //uint16_t externalCoolingOn;     // 0 - нет внешнего охлаждения, 1 - есть  
+  uint16_t polesPairsNum;         // Количество пар полюсов двигателя
+  uint16_t freqPWM;               // Частота ШИМ  
+  uint16_t debugMode;             // Режим работы отладочного порта(RS232): 0 - непрерывный режим, 1 - модбас-слейва
+  // End modbus    
+  uint16_t CRC16;                 // Контрольная сумма (CRC16 модбас)  
+  uint8_t updateFromShadow;       // Произошло изменение настроек теневой структуры    
+   //float instIlimit;            // Ограничение максимального мгновенного тока двигателя - Перенести в аварии??? 
+  float k1[CONTEXT_NUM];          // Первый коэффициент пропорциональности кусочно-непрерывной функции U12=U1+k1*f  интервал  [engine.minFreq; UF_TABLE_STRUCT.freq). Пересчитывается при изменении стру-ры  
+  float k2[CONTEXT_NUM];          // Второй коэффициент пропорциональности кусочно-непрерывной функции U23=U2+k2*f  интервал  [UF_TABLE_STRUCT.freq;engine.maxFreq]. Пересчитывается при изменении стру-ры      
+  float C1[CONTEXT_NUM];          // Постоянный коэффициент кусочно-непрерывной функции U12 
+  float C2[CONTEXT_NUM];          // Постоянный коэффициент кусочно-непрерывной функции U23   
+}ENGINE_SETTINGS_STRUCT;
+extern volatile ENGINE_SETTINGS_STRUCT engine,engineShadow;
+
+typedef struct{
+  // Start modbus
+  float startFreq[CONTEXT_NUM];         // Стартовая частота, имеет смысл только при старте привода 
+  
+  float dfdtUP[CONTEXT_NUM];  
+  float dfdtDOWN[CONTEXT_NUM];  
+  float curveStimeUP[CONTEXT_NUM];      // Задавать отдельно, как в ВЕСПЕРЕ, прибавка ко времени линейного участка  
+  float curveStimeDOWN[CONTEXT_NUM];    // Задавать отдельно, как в ВЕСПЕРЕ, прибавка ко времени линейного участка    
+  
+  uint16_t ufTableNum[CONTEXT_NUM];
+  uint16_t freqSource[CONTEXT_NUM];     // Источник задания частоты: 0 - модбас, 1 - ТИТ1, 2 - ТИТ2. Добавлено 30.01.2017 Рустем 	  
+  uint16_t contextSource;               // Источник задания контекста: 0 - модбас(modbus_context), 1 - состояние дискретного входа DI0 ( DI0_0_context/DI0_1_context ) 
+  uint16_t DI0_0_contextNum;
+  uint16_t DI0_1_contextNum;
+  uint16_t modbus_contextNum; 
+  uint16_t voltageShiftTime;    // При смене контекста может происходить переход к другой характеристике U(f), для плавного изменения напряжения - этот переход происходит со скоростью Вольт/сек.
+  // End modbus  
+  uint16_t CRC16;               //  Контрольная сумма (CRC16 модбас)    
+  uint8_t updateFromShadow;     // Произошло изменение настроек теневой структуры      
+  uint8_t curContextNum;        // Текущий номер контекста                
+  uint8_t prevContextNum;       // Предыдущий номер контекста           
+  
+  int32_t voltageShiftSamples;  //  voltageShiftTime в отсчетах ШИМ
+  float voltageShiftInc;      //  Инкремент приращения на каждом voltageShiftSamples - отсчете
+  float voltageShiftSum;
+  uint32_t Tl_d;                //  Время в тактах ШИМ линейного участка роста частоты от времени (upTl_d=dfdtUP*abs())
+  uint32_t Ts_d;                //  
+  float Tl;
+  float Ts;
+  float aConst;            
+  float K;  
+  float linkConst;              // Константа, отвечающая за сшивку наклонной разгонной характеристики для интегрирования       
+  
+  uint32_t sample;              // Счетчик для интегрирования      
+  
+  uint8_t DI_state;             // Произошла смена контекста с помощью дискретного входа: 0 - контакт замкнут, 1 - контакт разомкнут.  
+  int8_t DI_cnt;    
+}CONTEXT_SETTINGS_STRUCT;
+extern volatile CONTEXT_SETTINGS_STRUCT context,contextShadow;
+
+#define InstPhCurSampNum   2//8 // Кол-во усреднений, для вычиления мгновенных токов InstPhXCur, для борьбы с помехами
+typedef struct{  
+  uint16_t meanIaCode;
+  uint16_t meanIbCode;
+  uint16_t meanIcCode;
+
+  uint32_t meanIaCounter;
+  uint32_t meanIbCounter;
+  uint32_t meanIcCounter;  
+  
+  uint32_t meanCodeItems;
+  uint32_t meanCodeItemsNum;
+  uint8_t meanReady; // Достоверность данных по смещению напряжения с датчиков тока: 0 - данные не готовы, 1 - данные готовы
+
+  /*float*/int16_t InstPhACur;                  // Мгновенное выходное значение фазы А тока инвертора, мА 
+  /*float*/int16_t InstPhBCur;                  // Мгновенное выходное значение фазы B тока инвертора, мА
+  /*float*/int16_t InstPhCCur;                  // Мгновенное выходное значение фазы C тока инвертора, мА                  
+  
+  int16_t InstPhACurArray[InstPhCurSampNum];
+  int16_t InstPhBCurArray[InstPhCurSampNum];
+  int16_t InstPhCCurArray[InstPhCurSampNum];  
+  int16_t InstUdcArray[InstPhCurSampNum];
+  
+  int32_t InstPhACurSum;
+  int32_t InstPhBCurSum;
+  int32_t InstPhCCurSum;  
+  int32_t InstUdcSum;  
+  
+  uint8_t InstPhCurSampIndex;
+  uint8_t InstPhCurReady;      // Массив усреднения заполнен, данные готовы 
+  
+  int16_t Irms;                // Действующее значение тока двигателя, вычисляется по среднеквадратичным значениям токов фаз (InstPhACur, InstPhBCur, InstPhCCur)  
+  float IrmsMax;               // Защита по максимальному действующему значению тока двигателя, мА  
+  
+  // Переменные, отвечающие за вычисление действующих значений по периоду колебания фазных напряжения на двигателе
+  // Для соблюдения атомарности переменных, все счетчики имеют по две ячейки памяти, одна вычисляется, другая доступна по Модбас
+ 
+  float sumUa[2];
+  float sumUb[2];
+  float sumUc[2];
+
+  float sumIa[2];
+  float sumIb[2];
+  float sumIc[2];
+  
+  float sumPa[2];
+  float sumPb[2];
+  float sumPc[2];  
+  
+  float sumUdc[2];
+  
+  uint8_t energyRdy;            // 0 - энергетические параметры не готовы, 1 - энергетические параметры готовы
+  uint8_t indexToProcess;       // Номер индекса для вычисления, 0 или 1  
+  uint32_t sampNum[2];          // Счетчики количество периодов выходного напряжения для вычисления действующих значений
+  uint8_t endOfPeriodCnt;       // Конец периода выходного напряжения, питающего двигатель
+  uint8_t endOfPeriodsNum;      // Количество периодов выходного напряжения для вычисления действующих значений
+
+  float tempUa;
+  float tempUb;
+  float tempUc;
+  
+// Расположение переменных соответствует расположению регистров модбас, 600-653
+  float Iabc;  
+  float Ia;
+  float Ib;
+  float Ic;
+  
+  float Uavg;  
+  float Ua;
+  float Ub;
+  float Uc;
+
+  float Pabc;  
+  float Pa;
+  float Pb;
+  float Pc;
+  
+  float Qabc;  
+  float Qa;
+  float Qb;
+  float Qc;
+  
+  float Sabc;    
+  float Sa;
+  float Sb;
+  float Sc; 
+
+  float cosPhiAvg;
+  float cosPhiA;
+  float cosPhiB;
+  float cosPhiC;  
+  float Udc;
+  
+  float nomTorq;      // Номинальный момент 
+  float curSpeed;     // Текущие обороты в минуту с учетом скольжения
+  float curTorq;      // Текущий момент [Н*м]   
+  float torqPercent;  // Текущий процент от номинального момента
+    
+  int16_t tempSensor1;  // Температура конденсаторов
+  int16_t tempSensor2;  // Темпрература радиатора
+  uint16_t alarmBits1;  // Битовый регистр ошибок
+  uint16_t alarmBits2;  
+  uint16_t curFreq;     // Текущая частота
+  int16_t InstUdc;      // Мгновенное выходное напряжения DC-шины, В
+  int16_t maxUdc;       // Максимальное напрояжение DC-шины за период
+  int16_t minUdc;       // Минимальное напряжение DC-шины за период
+  int16_t ppUdc;        // Размах напряжения DC-шины за период      
+  int16_t maxIrms;      // Максимальный мгновенный действующий ток за период
+  int16_t minIrms;      // Минимальный мгновенный действующий ток за период  
+  int16_t ppIrms;       // Размах мгновенного действующего ток за период 
+  int16_t tempSensor3;  // Дополнительный внешний датчик температуры  
+  uint16_t setFreq;     // Заданная частота
+  uint16_t maxIstartValue;// Максимальный ток во время пуска двигателя
+  int16_t adcMV[4];     // Текущее значение каналов АЦП (ТИТ)
+  int16_t Q10;          // Текущая амплитуда 100 Гц гармоники
+  uint16_t TC;          // Состояния ТС (бит 0 - ТС1, бит 14 - ТС15)
+  uint16_t TU;          // Состояния ТУ (бит 0 - ТУ1, бит 3 - ТУ4), 1 - замкнут
+// Расположение переменных соответствует расположению регистров модбас, 200-247  
+  int16_t uMAX;         // [Временные переменные 
+  int16_t uMIN;         // для вычисления минимальный 
+  int16_t iMAX;         // и максимальных значения тока 
+  int16_t iMIN;         // и напряжения за период]
+  uint8_t periodLast;   // Индикация того, что период прошел. 
+  float scalarProduct;  // Мгновенная активная мощность, Вт  - для записи аварии  
+  int16_t adcCode[4];   // Текущее значение каналов АЦП (ТИТ), для вычисления поля adcMV 
+  uint8_t maxIstartFlag;// Флаг пуска двигателя, время после включения ШИМ до выхода на заданную частоту
+  uint16_t maxIstartValueTemp; //  Для вычисления максимального тока во время пуска двигателя и передачи по модбас
+}MEASUREMENTS_STRUCT;
+extern volatile MEASUREMENTS_STRUCT measurements;
+
+typedef struct{  
+  uint8_t outputsCommand;            // Команда для выводов ШИМ: 1 - выводы вкл, 2 - выводы выкл (включение/выключение происходим в прерывании ШИМ)
+  volatile uint8_t freqTrans;        // Если 1, то произвести переход на частоту command.desiredFreq
+  //uint16_t freqPWM;                  // Частота ШИМ  
+
+  volatile double activePddPhi;      // Борьба с рекуперацией через активную мощность, приращение добавочной фазы  
+  volatile double activePdPhi;       // Борьба с рекуперацией через активную мощность, добавочная фаза     
+  volatile double pidCurDeltaPhi;  
+  volatile float curDeltaPhi;        // Текущее приращение фазы гармонического колебания за период ШИМ'а (связано с начальной частотой)      
+  volatile float ddPhi;              // Дополнительное приращение, изменяется согласно арифметической прогрессии(b0=q=ddPi)     
+  volatile float curDeltaPhiIntegral;
+  volatile float curFreq;   
+  
+  volatile int16_t amplitudePWM;           // Амплитуда ШИМ  
+  volatile int16_t amplitudePWMcorrected;  // Амплитуда ШИМ  
+  volatile uint8_t newSettings;  
+  volatile int16_t lastAmplitudePWM;       // Код, связанный с напряжением на двигателе до смены контекста
+  volatile int16_t newAmplitudePWM; 
+  
+  volatile uint32_t debug;
+  
+  double doublePhi;
+  float floatPhi;
+  uint32_t currentPhi;         // Текущая фаза гармонического колебания  
+  uint16_t prevPhi;            // Предыдущая фаза гармонического колебания, для вычисления U=Udc*cos(prevPhi)...    
+  uint8_t isOn;                // 0-сигналы ШИМ, управляющие приводом выключены, 1 - включены   
+  uint8_t sector;              // Переменная алгоритма векторного ШИМ
+  int16_t dop;                 // Переменная алгоритма векторного ШИМ     
+  uint8_t deadTime;            // Задержка между комплементрарными сигналами ШИМ 
+  uint16_t arr;                // Регистр Auto Reload (ARR) - отвечает за частоту шим 
+  uint16_t arr2;               // Период ШИМ
+  uint16_t cc[4];              // Регистры сравнения каналов A[0],B[1],C[2],D[4]   
+  int16_t t1,t2,t3,Tb1,Tb2,To; // Переменные алгоритма векторного ШИМ       
+  
+  volatile uint16_t adcData[10];
+  volatile int16_t ia;
+  volatile int16_t ib;
+  volatile int16_t ic;
+  
+  uint8_t arrUpdate;          // Флаг обновления регистра сравнения центрированного ШИМ
+}VECTOR_PWM_STRUCT;
+extern VECTOR_PWM_STRUCT vectorPWM; 
+
+/*
+typedef struct{
+// Start ModBus
+  uint16_t adcMV[4];
+  uint16_t dacMV[2];  
+// Stop ModBus  
+  float adcCoeff[4];
+  float dacCoeff[4];  
+  uint16_t CRC16;      // Контрольная сумма вычисляется для adcCoeff[] и dacCoeff[]
+}ANALOG_CALIBRATION;
+extern ANALOG_SIGNALS_CALIBRATION analogCalibration, analogCalibrationShadow;
+*/
+
+typedef struct{
+// Start ModBus    
+  float minValue[2];  
+  float maxValue[2];  
+  uint16_t minMV[2];
+  uint16_t maxMV[2];  
+  uint16_t source[2];  // Источник сигналов АО: 0 - выкл, 1 - Fвых, 2 - об/мин, 3 - Pакт    
+// End ModBus
+  uint16_t CRC16;  
+  uint8_t updateFromShadow;     // Произошло изменение настроек теневой структуры   
+  uint16_t minCode[2];  // Код, соотв. minMV
+  uint16_t maxCode[2];  // Код, соотв. maxMV
+  uint32_t code[2];     // Выходной код для ЦАП 
+  float inputValue[2];  // Входная масштабируемя величина (источник сигнала)   
+  float k[2];           // Коэффициент k: F=k*adcCode+b
+  float b[2];           // Слагаемое b: F=k*adcCode+b 
+  float calibr[2];      // Калибровочные коэффициенты...  
+}DAC_OUTPUTS_STRUCT;
+extern DAC_OUTPUTS_STRUCT dacOutputs,dacOutputsShadow;
+
+typedef struct{
+// Start ModBus  
+  uint16_t minFreq[2];       // Минимальная частота, соответствующая минимальному коду АЦП
+  uint16_t maxFreq[2];       // Максимальная частота, соответствующая максимальному коду АЦП
+  uint16_t minMV[2];         // Минимальный код АЦП, соответствующий минимальной частоте
+  uint16_t maxMV[2];         // Максимальный код АЦП, соответствующий максимальной частоте
+  uint16_t meanMS[4];        // Время фиксации и усреднения уровня напряжения на входе ТИТ (10-10000) мс
+  uint16_t dmV[2];           // Разница между двумя усреднениями, при котором считаем сигнал устоявшемся
+  uint16_t oneHandrethDF[2]; // Разница в сотых Гц между outPutFreq и command.currentFreqOrRPM, при котором происходит изменение частоты
+  // End ModBus 
+  uint16_t CRC16;
+  uint8_t updateFromShadow;     // Произошло изменение настроек теневой структуры   
+  uint16_t minCode[2];
+  uint16_t maxCode[2];
+  //float mvToCodeCoeff[]
+  float k[2];            // Коэффициент k: F=k*adcCode+b
+  float b[2];            // Слагаемое b: F=k*adcCode+b
+  float df[2];           // oneHandrethDF в Гц
+  float outPutValue[2];  // Вычисленная выходная величина (частота, ...)
+  uint16_t adcData[4];   // Данные АЦП
+  int16_t curMean[4];    // Текущее среднее значение по каналу 
+  int16_t prevMean[2];   // Предыдущее среднее по каналу
+  uint32_t meanSum[4];   // Сумматор для усреднения 
+  uint32_t meanCnt[4];   // Счетчик сумматора для усреднения
+  uint32_t meanCntMax[4];// Перевод meanMS в meanCntMax 
+  uint8_t Ready[2];
+  float calibr[2];
+}ADC_INPUTS_STRUCT; 
+extern ADC_INPUTS_STRUCT adcInputs, adcInputsShadow; 
+
+extern volatile uint16_t shortCurrentCheck;
+void switchPWMtoDO(void);
+void switchDOtoPWM(void);

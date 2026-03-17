@@ -1,0 +1,119 @@
+[DebugChecksum]
+Checksum=863915812
+[Exceptions]
+StopOnUncaught=_ 0
+StopOnThrow=_ 0
+[CodeCoverage]
+Enabled=_ 1
+[Stack]
+FillEnabled=0
+OverflowWarningsEnabled=1
+WarningThreshold=90
+SpWarningsEnabled=1
+WarnLogOnly=1
+UseTrigger=1
+TriggerName=main
+LimitSize=0
+ByteLimit=50
+[CallStack]
+ShowArgs=0
+[Disassembly]
+MixedMode=0
+[SWOTraceHWSettings]
+OverrideDefaultClocks=0
+CpuClock=72000000
+ClockAutoDetect=0
+ClockWanted=2000000
+JtagSpeed=2000000
+Prescaler=36
+TimeStampPrescIndex=0
+TimeStampPrescData=0
+PcSampCYCTAP=1
+PcSampPOSTCNT=15
+PcSampIndex=0
+DataLogMode=0
+ITMportsEnable=0
+ITMportsTermIO=0
+ITMportsLogFile=0
+ITMlogFile=$PROJ_DIR$\ITM.log
+[Interrupts]
+Enabled=1
+[MemoryMap]
+Enabled=0
+Base=0
+UseAuto=0
+TypeViolation=1
+UnspecRange=1
+ActionState=1
+[InterruptStripe]
+Sort=1
+[SWOTraceWindow]
+PcSampling=1
+InterruptLogs=1
+ForcedTimeStamps=1
+EventCPI=1
+EventEXC=1
+EventFOLD=1
+EventLSU=1
+EventSLEEP=1
+[DataLog]
+LogEnabled=0
+SumEnabled=0
+GraphEnabled=0
+ShowTimeLog=1
+ShowTimeSum=1
+[InterruptLog]
+LogEnabled=0
+SumEnabled=1
+GraphEnabled=0
+ShowTimeLog=0
+ShowTimeSum=1
+SumSortOrder=0
+[struct_types]
+Fmt0=RTC_TimeTypeDef-Hours	3	0
+Fmt1=RTC_TimeTypeDef-Minutes	3	0
+Fmt2=RTC_TimeTypeDef-Seconds	3	0
+Fmt3=RTC_TimeTypeDef-SubSeconds	3	0
+Fmt4=RTC_TimeTypeDef-TimeFormat	3	0
+[array_types]
+Fmt0=uint32_t[100]	4	0
+Fmt1=uint8_t[1000]	4	0
+Fmt2=uint8_t[4096]	3	0
+Fmt3=uint8_t[5]	3	0
+Fmt4=uint8_t[9]	3	0
+Fmt5=unsigned int[2]	4	0
+[watch_formats]
+Fmt0={W}1:*(uint32_t*)&array1[0]	4	0
+Fmt1={W}1:*(uint32_t*)&array2[0]	4	0
+Fmt2={W}1:signalsTC	4	0
+Fmt3={W}1:system	4	0
+Fmt4={W}1:systemState.dataTC	4	0
+Fmt5={W}2:val_Float.Word[0]	4	0
+Fmt6={W}2:val_Float.Word[1]	4	0
+[Log file]
+LoggingEnabled=_ 0
+LogFile=_ ""
+Category=_ 0
+[TermIOLog]
+LoggingEnabled=_ 1
+LogFile=_ "$PROJ_DIR$\TermIO.log"
+[CallStackLog]
+Enabled=0
+[DriverProfiling]
+Enabled=0
+Mode=0
+Graph=0
+Symbiont=0
+Exclusions=
+[Disassemble mode]
+mode=2
+[Breakpoints2]
+Bp0=_ 0 "EMUL_CODE" "{$PROJ_DIR$\..\Src\read_write.c}.41.9" 0 0 1 "" 0 "" 0
+Count=1
+[Aliases]
+A0=_ "C:\PROJECTS\STM32CubeMXWorkspace\CHREP\newBoard\chrep_V4_slesarka\Drivers\CMSIS\Include\arm_math.h" ""
+A1=_ "C:\PROJECTS\STM32CubeMXWorkspace\CHREP\newBoard\chrep_V4_slesarka\Src\main.c" ""
+A2=_ "C:\PROJECTS\STM32CubeMXWorkspace\CHREP_V1_2_WiFi\Src\bvi.c" ""
+A3=_ "C:\PROJECTS\STM32CubeMXWorkspace\CHREP_V1_2_WiFi\Src\main.c" ""
+Count=4
+SuppressDialog=0

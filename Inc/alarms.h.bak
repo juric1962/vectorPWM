@@ -1,0 +1,240 @@
+#include "stm32f4xx_hal.h"
+
+// Список событий для работы в режиме автоматического повторного запуска
+#define BRIDGE_SATURATION_FAULT     6    //#define INST_OVERCURRENT_FAULT      1 // #define RMS_OVERCURRENT_FAULT,  
+#define UDC_OVERVOLTAGE_FAULT       5       
+#define ETR_OVERLOAD_FAULT          4
+#define BREAK_PHASE_CURRENT_FAULT   3 // #define CURRENT_DISBALANCE_FAULT  
+#define TEMP_SENS_FAULT             2
+#define LOW_VOLTAGE_FAULT           1
+#define NO_LOAD_FAULT               0
+
+#define FAULT_ARRAY_ITEMS_NUM 7       // Общее количество событий для работы в режиме автоматического повторного запуска (АПВ)
+typedef struct{
+  uint16_t upCnt;            // Инкрементируемый счетчик аварии, при достяжении нуля - автоматический повтороный пуск запрещен 
+  uint16_t maxCnt;           // Максимальное значение инкрементируемого счетчика
+  uint16_t recoverCntMin;    // Секундный счетчик, отвечающий за декрементацию счетчика аварий upCnt в случае его переполнения     
+  uint32_t recoverTime;      // Временная метка, выставляется по конкретной аварии, при сравнении с текущем временем принимается решение о декрементировании счетчика upCnt  
+  uint16_t CRC16;            // Контрольная сумма структуры, т.к. время работы с самой надежной в нашей системе FRAM-памятью медленное, запись одного байта примерно 10 мкс, то буду сохранять каждое событие отдельно 
+}FAULT_EVENT_STRUCT;         // Структура для автоматического включения, для удобства однообразной отработки аварий 
+//extern volatile FAULT_EVENT_STRUCT *faultStruct;//[FAULT_ARRAY_ITEMS]; // Массив событий АПВ
+extern volatile FAULT_EVENT_STRUCT *faultsArrayNVRAM;
+uint8_t  faultCountersUpdate(uint8_t num); // Обновить состояние счетчиков аварий, с учетом recoverCntSec
+uint8_t faultEventAdd(uint8_t num);    // Добавить событие, если функция возвращает не ноль, то выключить двигатель, продолжать работу с ЧРЭП можно только после сброса ошибок при переключении тумблера "АВТО/РУЧН." или через модбас                            
+uint32_t faultsInit(void); // Инициализация массива АПВ  
+void faultCountersReset(void); 
+/*
+// 1) ЭТР инвертора:
+typedef struct{
+  uint16_t overloadPercent;    // Уставка двигателя по перегрузка в процентах относительно номинального тока         
+  float overloadCurrent;       // уставка тока 
+  uint16_t overloadSec;        // Уставка двигателя по времени для overloadPercent  
+  float overloadLimit;         // Порог срабатывания защиты ETR: (overloadPercent*Inom/100)^2*overloadSec
+  float overloadCnt;           // Счетчик для сравнения с overloadLimit         
+  uint32_t timeStamp;          // Метка последнего учтенного отсчета тока, храниться в NVRAM RTC, время UNIX в системе вычисляется раз в секунду???
+  uint8_t powerOn;             // Флаг перезагрузки контроллера, только по этому флагу использовать timeStamp, при обычной 
+                               // работе мы можем посчитать точное количество периодов ШИМ 
+  uint8_t autoRestartNum;      // Количество перезапусков, повторный запуск разрешен, если (overloadCnt)<(0.9*overloadLimit) 
+  uint8_t alarm;               // Флаг аварии для обработки события в основном цикле, выставляется в прерывании АЦП    							   
+}ETR_STRUCT_INVERTER;
+extern ETR_STRUCT_INVERTER inverterETR; 
+*/
+// 2) ЭТР двигателя:
+typedef struct{  
+  // Start ModBus        
+  float freqCorrPoints[2];        // Кусочная зависимость уставочного тока overloadPercent от частоты (часоты), при этом крайними точками являются engine.minFreq и engine.maxFreq
+  float currentCorrPoints[4];     // Кусочная зависимость уставочного тока overloadPercent от частоты (уставочные токи в %)          	   
+  uint16_t overloadPercent;       // Уставка двигателя по перегрузке в процентах относительно номинального тока           
+  uint16_t normalConditionsPercent;// Процент от порога срабатывания защиты ETR [((overloadPercent*Inom)^2)*overloadSec], при котором возможен пуск
+  uint16_t overloadSec;           // Уставка двигателя по времени   
+  uint16_t externalCoolingOn;     // 0 - нет внешнего охлаждения, 1 - есть    
+  uint16_t isOn;                  // 0-защита выключена, 1 - защита включена, 2 - принудительный сброс счетчика   
+  // End ModBus
+  uint16_t CRC16;              // Контрольная сумма (CRC16 модбас)  
+  uint8_t updateFromShadow;    // Произошло изменение настроек теневой структуры    
+  float overloadCurrent;       // уставка тока 
+  float overloadLimit;         // Порог срабатывания защиты ETR: ((overloadPercent*Inom)^2)*overloadSec  
+  float overloadCnt;           // Счетчик для сравнения с overloadLimit  
+  uint16_t overloadCntCRC;     // Контрольная сумма счетчика для сравнения с overloadLimit 
+  uint16_t autoRestartNum;     // Количество перезапусков, повторный запуск разрешен, если (overloadCnt)<(0.9*overloadLimit)          
+  float k1,k2,k3;              // Кусочная зависимость уставочного тока overloadPercent от частоты (углы наклона)
+  float C1,C2,C3;              // Кусочная зависимость уставочного тока overloadPercent от частоты (постоянные составляющие)         
+  float I;
+  uint32_t Isum;
+  uint16_t IsumCnt;  
+}ETR_ENGINE_STRUCT;
+extern volatile ETR_ENGINE_STRUCT etrEngine,etrEngineShadow; 
+
+typedef struct{  
+//----------------- ModBus regs start ------------------------------------------
+  //uint16_t bridgeSaturationRecoverCntLimit; // Предел инкрементируемого cчетчика аварий 
+  //uint16_t bridgeSaturationResetCnt;        // Секундный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения
+  
+  uint16_t InstPhCurMaxPercent;               // Уставка по максимальному мгновенному выходному току инвертора, % от номинальная тока  
+  uint16_t InstPhCurMaxSampNum;               // Количество отсчетов для усреднения    
+  //uint16_t InstPhCurMaxRecoverCntLimit;     // Предел инкрементируемого cчетчика аварий 
+  //uint16_t InstPhCurMaxResetCnt;            // Секундный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения  
+  
+  uint16_t IrmsMaxPercent;                  // Уставка по максимальному действующему току инвертора, % от номинальная тока  
+  uint16_t IrmsMaxMS;                       // Время удержания, мс   
+  uint16_t IrmsMaxRecoverCntLimit;          // Предел инкрементируемого cчетчика аварий, сюда в данный момент входят нсыщение ключей, мгновенный и действующий ток 
+  uint16_t IrmsMaxResetCnt;                 // Минутный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения  
+  
+  uint16_t breakCurMinPercent;              // Ток обрыва фазы, % от номинальная тока  
+  uint16_t breakCurMinMS;                   // Время удержания, мс   
+  //uint16_t breakCurMinRecoverCntLimit;    // Предел инкрементируемого cчетчика аварий 
+  //uint16_t breakCurMinResetCnt;           // Секундный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения    
+  
+  uint16_t curDisbalanceMaxPercent;         // Дизбаланс тока, % от номинальная тока  
+  uint16_t curDisbalanceMaxMS;              // Время удержания, мс  
+  uint16_t curDisbalanceMaxRecoverCntLimit; // Предел инкрементируемого cчетчика аварий 
+  uint16_t curDisbalanceMaxResetCnt;        // Минутный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения  
+  
+  //uint16_t lowVoltageFixFreqEnable;         // Признак разрешения перехода на фиксированную частоту
+  //uint16_t lowVoltageFixFreq;               // Фиксированная частота
+  //uint16_t lowVoltageFixFreqSec;            // Время удержания для перехода на фиксированную частоту, с
+  //uint16_t lowVoltageOffSec;                // Время удержания для фиксации пониженного напряжения, с  
+  //uint16_t lowVoltageOffRecoverCntLimit;    // Предел инкрементируемого cчетчика аварий 
+  //uint16_t lowVoltageOffResetCnt;           // Секундный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения    
+  
+  uint16_t highVoltageOffRecoverCntLimit;   // Предел инкрементируемого cчетчика аварий по высокому напряжению 
+  uint16_t highVoltageOffResetCnt;          // Минутный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения    
+  
+  uint16_t noLoadWatts;                     // Мощность холостого хода
+  uint16_t noLoadWattsSec;                  // Время удержания холостого хода, с   
+  uint16_t noLoadWattsRecoverCntLimit;      // Предел инкрементируемого cчетчика аварий 
+  uint16_t noLoadWattsResetCnt;             // Минутный счетчик, отвечающий за декрементацию счетчика аварий в случае своего переполнения   
+  
+  uint16_t etrRecoveryCntLimit;             // Счетчик АПВ по ЭТР
+  uint16_t etrResetCnt;                     // Минутный счетчик, отвечающий за декрементацию счетчика ЭТР      
+ 
+  uint16_t lowVoltageRecoveryCntLimit;      // Счетчик АПВ по низкому напряжению (Udc<373V, мгновенное значение, возврат в норму: Udc>430В, мгновенное значение)   
+  uint16_t lowVoltageResetCnt;              // Минутный счетчик, отвечающий за декрементацию счетчика аварий в случае низкого напряжения
+  //----------------------------------------------------------------------------
+  uint16_t fixFreqEnable;                   // Разрешение работы в режиме аварийной питающей сети (АПС), переход на фиксированную частоту
+  uint16_t fixFreqLowVoltageValue;          // Аварийное напряжение, в случае удержания ниже него в течение lowVoltageMS миллисекунд - будет либо авария (powerErrorWorkEnable=0),
+  uint16_t fixFreqLowVoltageMS;             // либо переход на фиксированную величину (powerErrorWorkEnable=0), если 0 - то не анализируется 
+  uint16_t fixFreqPhaseErrorValue;          // Авария по размаху гармоники 100 Гц напряжения DC-шины,  в случае удержания ниже него в течение phaseErrorMS миллисекунд - будет либо авария (powerErrorWorkEnable=0), 
+  uint16_t fixFreqPhaseErrorMS;             // либо переход на фиксированную величину (powerErrorWorkEnable=0), если 0 - то не анализируется
+  uint16_t fixFreqValue;                    // Значение фиксированной максимальной частоты   
+  uint16_t fixFreqAttemptsNumMax;           // Количество последовательных с периодом в fixFreqAttemptsPeriodMin попыток выхода из режима фиксированной частоты, если 0 - то переход в аварию сразу
+  uint16_t fixFreqAttemptsPeriodMin;        // Период между попытками выхода на режим работы с частотой выше фиксированной, если 0, то не выходить из режима фиксированной частоты, минут  
+  uint16_t fixFreqAttemptsNumResetMin;      // Период сброса счетчика попыток выхода на режим работы с частотой выше фиксированной, если = 0, то счетчик попыток не сбрасывать, минут
+  //----------------------------------------------------------------------------
+  uint16_t temperatureRecoveryCntLimit;     //  Счетчик АПВ по температуре
+  uint16_t temperatureResetCnt;             // Минутный счетчик, отвечающий за декрементацию счетчика аварий в превышения температур
+  
+  uint16_t internalTemperatureMAX;          // Аварийная температура отсека конденсаторов, 0С
+  uint16_t internalTemperatureNORM;         // Температура отсека конденсаторов, допускающая возобновление работы, 0С  
+  
+  uint16_t radiatorTemperatureMAX;          // Аварийная температура радиатора, 0С  
+  uint16_t radiatorTemperatureNORM;         // Температура радиатора, допускающая возобновление работы, 0С    
+//----------------- ModBus regs end --------------------------------------------  
+  uint16_t CRC16;
+  uint8_t updateFromShadow; 
+  
+  uint16_t InstPhCurMax;
+  uint16_t IrmsMax;  
+  uint16_t breakCurMin;
+  uint16_t curDisbalanceMax;
+  
+  int32_t InstPhCurMaxSumA;  // Счетчик для вычисления среднего значения мгновенного тока по каналу A за InstPhCurMaxSampNum отсчетов 
+  int32_t InstPhCurMaxSumB;  // Счетчик для вычисления среднего значения мгновенного тока по каналу B за InstPhCurMaxSampNum отсчетов 
+  int32_t InstPhCurMaxSumC;  // Счетчик для вычисления среднего значения мгновенного тока по каналу C за InstPhCurMaxSampNum отсчетов 
+  uint16_t InstPhCurMaxCnt;  // Количество накопленных отсчетов для вычисления среднего значения мгновенных токов
+  
+  uint32_t IrmsMaxCounter;
+  
+  uint16_t breakCurAMinCounterMS;
+  uint16_t breakCurBMinCounterMS;
+  uint16_t breakCurCMinCounterMS;
+  uint16_t curDisbalanceMaxCounterMS;       
+  
+  uint16_t fixFreqLowVoltageCnt;    // Счетчик удержания для fixFreqlowVoltageMS
+  uint16_t fixFreqPhaseErrorCnt;    // Счетчик удержания для fixFreqPhaseErrorMS   
+    
+  float noLoadWattsSecCnt;    
+  uint16_t faultBits;  /* Слово состояния привода, биты: 
+  0 - (BRIDGE_SATURATION, 1.0) насыщение полумоста A                                                           
+  1 - (BRIDGE_SATURATION, 2.0) насыщение полумоста B 
+  2 - (BRIDGE_SATURATION, 3.0) насыщение полумоста C
+  3 - UDC_OVERVOLTAGE (перенапряжение шины Udc)
+  4 - INST_A_OVERCURRENT (мгновенный ток бльше уставки по каналу A)
+  5 - INST_B_OVERCURRENT (мгновенный ток бльше уставки по каналу B)
+  6 - INST_C_OVERCURRENT (мгновенный ток бльше уставки по каналу C)
+  7 - RMS_OVERCURRENT (rms значение тока больше уставки в течение установленного периода времени)
+  //8 - I_SUM_NO_ZERO (защита по току нулевой последовательности)
+  9 - ETR_OVERLOAD (сработала защита по тепловому реле)
+  10- BREAK_I_A (обрыв фазы А)
+  11- BREAK_I_B (обрыв фазы B)
+  12- BREAK_I_C (обрыв фазы C)
+  13- CURRENT_DISBALANCE (дисбаланс токов)    
+  14- TEMP_SENS1_ALARM
+  15- TEMP_SENS2_ALARM 
+  */ 
+  uint16_t faultBitsExtended; /* Расширенное слово состояния привода, биты:
+  0 - напряжение на DC-шине ниже 373 В 
+  1 - ошибка холостого хода, величина активной мощности меньше уставки в течение времени удержания  
+  2 - Ротор вращается со скоростью больше синхронной на command.dFMaxCorrection
+  4 - флаг режима фиксированной частоты по низкому напряжению DC-шины
+  8 - флаг режима фиксированной частоты по неполнофазному режиму DC-шины
+  */
+}ALARMS_STRUCT;
+extern volatile ALARMS_STRUCT alarms, alarmsShadow;  
+
+void alarmsResetCounters(void);
+void alarmsInit(void);
+float freqCorrection(float freq);
+void getFaultBits(void);
+
+typedef struct{
+  uint16_t satA;
+  uint16_t satB;
+  uint16_t satC;
+  uint16_t overVoltage;
+  uint16_t instA;
+  uint16_t instB;
+  uint16_t instC;
+  uint16_t rms;
+  uint16_t etr;
+  uint16_t breakA;
+  uint16_t breakB;
+  uint16_t breakC;
+  uint16_t disbalance;
+  uint16_t temp1;
+  uint16_t temp2;
+  uint16_t lowVoltage;  
+  uint16_t fixFreqLowVoltage; // Счетчик аварий по удержанию низкого напряжения на DC-шине
+  uint16_t fixFreqNoPhase;    // Счетчик аварий по удержанию неполнофазного режима работы ЧРЭП (размаху 100Гц-гармоники)
+  uint16_t noLoad;
+  uint16_t adc_pwm_err;
+  uint16_t adc_energy_err;
+  uint16_t eventsCntDefaults;
+  uint16_t etrDefaults;
+  uint16_t alarmsDefaults;
+  uint16_t faultsDefaults;  
+  uint16_t commandDefaults;  
+  uint16_t contextDefaults;  
+  uint16_t adcDefaults;  
+  uint16_t dacDefaults;    
+  uint16_t engineDefaults;    
+  uint16_t HSE_init_err;  
+  uint16_t RTC_init_err;
+  uint16_t iwdg;
+  uint16_t iwdgDelayMS;
+  uint16_t CRC16;
+  uint16_t refresh;       // Для внесения изменений в счетчики по модбас
+}EVENTS_COUNTER_STRUCT;
+extern volatile EVENTS_COUNTER_STRUCT eventsCnt;
+void eventsCntInit(void);
+
+typedef struct{
+  uint32_t eventTimeStamp;  // UNIX-время с 01.01.2000 г. возникновения события
+  uint16_t fixFreqMode;      // Режим ограничения максимальной выходной частоты
+  uint16_t fixFreqAttempt;   // Текущая попытка выхода из режима ограничения максимальной выходной частоты   
+  uint16_t CRC16;    
+}FIX_FREQ_STATE_STRUCT;
+extern volatile FIX_FREQ_STATE_STRUCT *fixFreq; 
+
+void fixFreqInit(void);
+void fixfreqTask(void);

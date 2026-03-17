@@ -1,0 +1,16 @@
+адрес в флеш памяти    к-во байт  модбас регистр   тип поля
+                       во флеш
+A_IP                          1        ip0_sim800  uint  IP адрес              10  порядок в памяти н-р 10.1.1.17
+A_IP+1                        1        ip1_sim800  uint  сервера связи          1
+A_IP+2                        1        ip2_sim800  uint                         1
+A_IP+3                        1        ip3_sim800  uint                         17
+
+A_PORT                        2        port_sim800  uint  udp порт 
+A_NUM                         2        num_sim800  uint    адрес устройства
+
+A_NAT                        2        nat_sim800  uint   время удержания сессии
+A_CCH                        2        cch_sim800  uint   период контроль канала
+A_TM_CH                        2      tm_ch_sim800  uint 
+
+A_C_GPRS                       58        a_c_gprs_sim800   str    логин оператора связи
+                                                           строка должна заканчиваться нулем !

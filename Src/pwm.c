@@ -1,0 +1,1770 @@
+#include "stm32f4xx_hal.h"
+#include "pwm.h"
+#include <arm_math.h>
+#include "main.h"
+#include "modbus.h"
+#include "alarms.h"
+#include "bvi.h"
+#include "DS18B20.h"
+#include "sram_rtc.h"
+#include "dynagram.h"
+
+#define G1    91  // 32768/360=91.0(2)
+#define G60   5461//(16384/3)
+#define G120  10923//(32768/3)
+#define G180  (16384)
+#define G240  21845//(65536/3)
+#define G300  27307//(81920/3)
+#define G360  (32768)
+
+volatile int16_t prevPWMstab;
+volatile int16_t deltaStab;
+volatile uint8_t stabState=0;
+
+ADC_INPUTS_STRUCT adcInputs,adcInputsShadow; 
+DAC_OUTPUTS_STRUCT dacOutputs,dacOutputsShadow;
+
+VECTOR_PWM_STRUCT vectorPWM;
+volatile MEASUREMENTS_STRUCT measurements;
+
+volatile COMMAND_STRUCT command,commandShadow;
+volatile ENGINE_SETTINGS_STRUCT engine,engineShadow;
+volatile CONTEXT_SETTINGS_STRUCT context,contextShadow;
+
+void vectorPWMSetPhi0(void) // При включении или сбое программы установить начальный угол в ноль
+{
+  vectorPWM.newSettings=0;
+  vectorPWM.currentPhi=0;
+  vectorPWM.prevPhi=0;
+  vectorPWM.floatPhi=0.0;
+  vectorPWM.doublePhi=0.0;
+}
+
+void vectorPWMInit(uint16_t freqPWM)
+{
+  engine.freqPWM=freqPWM;  
+  vectorPWM.arr=84000000L/engine.freqPWM-1;       //168 MГц/2 = 84000000 - в режиме center aligned    
+  vectorPWM.arr2=2*vectorPWM.arr+1;  
+  vectorPWM.arrUpdate=1;  
+}
+
+int16_t U_f_dependancy(float curDeltaPhi)
+{
+  // 32767 - 380 В
+  //     0 -   0 В    
+  int32_t value; 
+  vectorPWM.curFreq=curDeltaPhi*(float)engine.freqPWM;
+  command.currentFreqOrRPM=vectorPWM.curFreq;
+  measurements.setFreq=(uint16_t)(command.currentFreqOrRPM*100.0f);
+  curDeltaPhi=(curDeltaPhi+(float)vectorPWM.activePdPhi)*(float)engine.freqPWM;
+  measurements.curFreq=(uint16_t)(curDeltaPhi*100.0f); 
+  curDeltaPhi=(curDeltaPhi-engine.maxFreq);  
+
+  if(curDeltaPhi>((float)command.dFMaxCorrection)) // Когда ротор вращается со скоростью больше синхронной на command.dFMaxCorrection
+  {
+    vectorPWM.curDeltaPhi=0.0f;
+    vectorPWM.pidCurDeltaPhi=0.0f;    
+    DRIVER_STOP(1);          
+    alarms.faultBitsExtended|=0x0004; 
+    eventLogWrite(11); 
+    vectorPWM.outputsCommand=2;
+    eventsCnt.noLoad++;                  
+    systemState.faults=(1L<<NO_LOAD_FAULT);     
+    FAULT_OPTO_OUT(1);               
+  }
+  
+  if(vectorPWM.curFreq>=engine.ufTable[context.ufTableNum[context.prevContextNum]].freq) 
+  {  
+    value=(int32_t)((engine.k2[context.prevContextNum]*vectorPWM.curFreq+engine.C2[context.prevContextNum])*86.228947f);   // 86.228947f=32767/380
+  }else if(vectorPWM.curFreq>=engine.minFreq)
+        {    
+          value=(int16_t)((engine.k1[context.prevContextNum]*vectorPWM.curFreq+engine.C1[context.prevContextNum])*86.228947f);   
+        }else value=0;
+  
+  if(value>32767)value=32767;  
+  
+  return (int16_t)value;
+}
+
+void setFreqRoutine(void)
+{  
+  //----------------------------------------------------------------------------
+  if(dynaGram.algorithmState)
+  { 
+    if(dynaGram.error)
+    {
+      dynaGram.algorithmFreq=dynaGram.algorithmFmin;
+    }else{
+      if(dynaGram.algorithmState==2)
+      {      
+        if(dynaGram.updateFreq){dynaGram.algorithmFreq=dynaGram.algorithmUpdateFreq;dynaGram.updateFreq=0;}   
+      }else{      
+        dynaGram.algorithmFreq=dynaGram.algorithmFstart;
+      }    
+    }
+    systemState.desiredFreqOrRPM=dynaGram.algorithmFreq;
+  }  
+  //----------------------------------------------------------------------------
+  if(systemState.desiredFreqOrRPM<engine.minFreq){systemState.desiredFreqOrRPM=engine.minFreq;commandShadow.desiredFreqOrRPM=systemState.desiredFreqOrRPM;}
+  if(systemState.desiredFreqOrRPM>engine.maxFreq){systemState.desiredFreqOrRPM=engine.maxFreq;commandShadow.desiredFreqOrRPM=systemState.desiredFreqOrRPM;}                            
+  
+  if(fixFreq[0].fixFreqMode) // Включен режим ограничения максимальной выходной частоты
+  {
+    if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE)) // Готов к изменению выходной частоты
+    {  
+      if(fixFreq[0].fixFreqControl<2)fixFreq[0].fixFreqControl++;
+      if(command.currentFreqOrRPM>alarms.fixFreqValue)
+      {
+        systemState.desiredFreqOrRPM=alarms.fixFreqValue;
+      }
+      if(systemState.desiredFreqOrRPM>alarms.fixFreqValue)
+      {
+        systemState.desiredFreqOrRPM=alarms.fixFreqValue;
+      }
+    }
+  }else fixFreq[0].fixFreqControl=0;
+  
+  if((systemState.desiredFreqOrRPM-command.currentFreqOrRPM)>0.001f)
+  {
+    if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))systemState.nextState=ENGINE_UP;   // Разгон 
+  }else{                
+     if((command.currentFreqOrRPM-systemState.desiredFreqOrRPM)>0.001f)
+     {
+       if(systemState.curState==ENGINE_READY)systemState.nextState=ENGINE_DOWN; // Торможение 
+     }
+  }
+}
+
+void titRoutine(uint8_t i)
+{
+  if(i<2)
+  {
+    if((adcInputs.outPutValue[i]-command.currentFreqOrRPM)>adcInputs.df[i])
+    {
+      systemState.desiredFreqOrRPM=adcInputs.outPutValue[i];                    
+    }else{                
+      if((command.currentFreqOrRPM-adcInputs.outPutValue[i])>adcInputs.df[i])
+      {
+        systemState.desiredFreqOrRPM=adcInputs.outPutValue[i];                      
+      }
+    }
+  }
+}
+
+#define DI_DECIMATION 10  // Децимация семплов ШИМ для обработки входов DI, чтобы не перегружать процессор частой обработкой медленных процессов 
+uint8_t dI=0;
+volatile uint16_t shortCurrentCheck=1; // Проверка на к.з. перед пуском
+uint8_t regularStart=0;
+uint8_t dynaGramAlarmFlag=0;
+void vectorPWMcalc()
+{   
+  if(dI<DI_DECIMATION)
+  {
+    dI++;
+  }else{            
+    handlerTC(&systemState.stateTC,&systemState.dataTC,&systemState.resetTC);   
+    dI=0; 
+    if(TCInputs.modBusWrite)
+    {      
+      TCInputs.modBusWrite++;
+      if(TCInputs.modBusWrite>10)
+      {
+        for(uint8_t i=0;i<15;i++)TCInputs.transitionsNum[i]=TCInputs.modBusBuffer[i];
+        TCInputs.modBusWrite=0;
+      }
+    }
+    if(systemState.skipDoublePress)systemState.skipDoublePress--;
+    if(systemState.stateTC&0x0400) // Состояние ТС15 - BRIDGE_SATURATION_FAULT установлено
+    {
+      if(systemState.dataTC&0x0400){
+        if(((systemState.curState!=ENGINE_FAULT)&&((systemState.curState!=ENGINE_IDLE)))||(shortCurrentCheck>=100))
+        {
+          DRIVER_STOP(1);          
+          getFaultBits();
+          systemState.resetTC=0x0400;    
+          eventLogWrite(3);           
+          eventsCnt.satA++; 
+          eventsCnt.satB++;
+          eventsCnt.satC++; 
+          vectorPWM.outputsCommand=2;                                 
+          systemState.faults=(1L<<BRIDGE_SATURATION_FAULT);         
+          FAULT_OPTO_OUT(1);          
+        }else{
+          
+        }
+      }   
+    }
+      
+    if(systemState.stateTC&0x0001) // Состояние ТС1 установлено
+    {
+      if(systemState.dataTC&0x0001) // Включен режим "Автономный"
+      {                
+        if(command.autoMode)// режим "АВТОНОМНЫЙ КП" 
+        {                 
+          systemState.curMode=2;
+        }else{ // режим "АВТОНОМНЫЙ ЧРЭП"                 
+          systemState.curMode=1;
+        }      
+        systemState.prevMode=systemState.curMode;      
+      }else{ // Включен режим "Ручной"               
+        systemState.curMode=3; 
+        systemState.prevMode=systemState.curMode;      
+      }
+      if(systemState.Ready==1) // Произошло включение, заряд конденсаторов, усреднение сигнала с токовых датчиков
+      {            
+        if(systemState.curMode==1) // Режим ЧРЭП
+        {
+          if(command.delayBeforeStartIter==0)
+          {
+             if(systemState.startDisable==0)
+             {
+               command.delayBeforeStartIter=command.delayBeforeRestartSec*engine.freqPWM/DI_DECIMATION; 
+               command.beepDelayBeforeStartIter=10*engine.freqPWM/DI_DECIMATION; 
+             }
+          }         
+        }          
+        if(command.delayBeforeStartIter)
+        {
+          command.delayBeforeStartIter--;          
+        }          
+        if(command.delayBeforeStartIter==0)
+        {  
+          /*for(uint8_t i=0;i<10;i++)
+          {            
+            if(bviArray[i]>3)forceBVI(i, 0);
+          }
+          forceBVI(8, 7);
+          forceBVI(9, 0);*/
+          systemState.Ready=2; // Прошла диагностика, установлен режим работы
+        }
+      }      
+    }    
+  }
+  
+  if(dacOutputsShadow.updateFromShadow==2)
+  {    
+    for(uint8_t i=0;i<2;i++)
+    {      
+      dacOutputs.k[i]=dacOutputsShadow.k[i];
+      dacOutputs.b[i]=dacOutputsShadow.b[i];  
+      dacOutputs.source[i]=dacOutputsShadow.source[i];
+    }
+    dacOutputsShadow.updateFromShadow=0;    
+  }
+  
+  for(uint8_t i=0;i<2;i++)
+  {
+    switch(dacOutputs.source[i])
+    {      
+      case 1: 
+        dacOutputs.inputValue[i]=(float)measurements.curFreq/100.0f;  // Пока это частота статора
+      break;
+      case 2: 
+        dacOutputs.inputValue[i]=measurements.curSpeed;     
+      break;
+      case 3:
+        dacOutputs.inputValue[i]=measurements.Pabc;
+      break;
+      case 4:
+        dacOutputs.inputValue[i]=measurements.curTorq;
+      break;
+      case 5:
+        dacOutputs.inputValue[i]=measurements.torqPercent;
+      break;
+      default:
+         dacOutputs.inputValue[i]=0.0f;
+      break;
+    }    
+    
+    dacOutputs.code[i]=(uint32_t )(dacOutputs.inputValue[i]*dacOutputs.k[i]+dacOutputs.b[i]);        
+    if(dacOutputs.code[i]>4095)dacOutputs.code[i]=4095;
+    HAL_DAC_SetValue(&hdac,i,DAC_ALIGN_12B_R,dacOutputs.code[i]);   
+  } 
+  
+  if(adcInputsShadow.updateFromShadow==2)
+  {    
+    for(uint8_t i=0;i<2;i++)
+    {      
+      adcInputs.df[i]=adcInputsShadow.df[i]; 
+      adcInputs.k[i]=adcInputsShadow.k[i];  
+      adcInputs.b[i]=adcInputsShadow.b[i];
+      adcInputs.dmV[i]= adcInputsShadow.dmV[i];
+      adcInputs.meanCntMax[i]=adcInputsShadow.meanCntMax[i];      
+      adcInputs.calibr[i]=0.3672f;
+      adcInputs.meanSum[i]=0;
+      adcInputs.meanCnt[i]=0;  
+      adcInputs.Ready[i]=0;
+    }
+    adcInputs.meanCntMax[2]=adcInputsShadow.meanCntMax[2];
+    adcInputs.meanCntMax[3]=adcInputsShadow.meanCntMax[3];    
+    adcInputs.meanSum[2]=0;
+    adcInputs.meanSum[3]=0;
+    adcInputs.meanCnt[2]=0;      
+    adcInputs.meanCnt[3]=0;          
+    adcInputsShadow.updateFromShadow=0;    
+  }
+  
+  for(uint8_t i=2;i<4;i++)
+  {
+    adcInputs.meanSum[i]+=adcInputs.adcData[i];
+    adcInputs.meanCnt[i]++;
+    if(adcInputs.meanCnt[i]>adcInputs.meanCntMax[i])  
+    {
+      adcInputs.curMean[i]=adcInputs.meanSum[i]/adcInputs.meanCnt[i];               
+      measurements.adcCode[i]=adcInputs.curMean[i];
+      adcInputs.meanSum[i]=0;
+      adcInputs.meanCnt[i]=0; 
+    }  
+  }  
+  
+  for(uint8_t i=0;i<2;i++)
+  {
+    adcInputs.meanSum[i]+=adcInputs.adcData[i];
+    adcInputs.meanCnt[i]++;
+    if(adcInputs.meanCnt[i]>adcInputs.meanCntMax[i])  
+    {
+      adcInputs.curMean[i]=adcInputs.meanSum[i]/adcInputs.meanCnt[i];               
+      measurements.adcCode[i]=adcInputs.curMean[i];
+      adcInputs.meanSum[i]=0;
+      adcInputs.meanCnt[i]=0;  
+      if(adcInputs.Ready[i])
+      {
+        if(adcInputs.curMean[i]>=adcInputs.prevMean[i])
+        {
+          if(adcInputs.curMean[i]-adcInputs.prevMean[i]<adcInputs.dmV[i])
+          {
+            adcInputs.outPutValue[i]=adcInputs.k[i]*((float)adcInputs.curMean[i])+adcInputs.b[i]; 
+          }
+        }else{
+           if(adcInputs.prevMean[i]-adcInputs.curMean[i]<adcInputs.dmV[i])
+           {
+             adcInputs.outPutValue[i]=adcInputs.k[i]*((float)adcInputs.curMean[i])+adcInputs.b[i]; 
+           }                        
+        }  
+        adcInputs.Ready[i]=2;
+      }else adcInputs.Ready[i]=1;                                     
+      adcInputs.prevMean[i]=adcInputs.curMean[i];                                                               
+    }   
+  }
+  
+  
+  
+  if(systemState.Ready==2)
+  {    
+    if(systemState.tempMode) // Инициализация режима произошла
+    {
+      if(systemState.modeSwitchTimer>1)
+      {
+        systemState.modeSwitchTimer--;
+        systemState.curMode=systemState.tempMode;        
+      }else{        
+        if(systemState.modeSwitchTimer==1)
+        { 
+          systemState.startDisable=0;
+          systemState.modeSwitchTimer=0;                            
+          systemState.tempMode=systemState.prevMode;
+          systemState.curMode=systemState.prevMode;
+          eventLogWrite(16); 
+          faultCountersReset();         
+          command.stopCHREP=0; // Сброс регистра останова с ДП тумблером, флаг-регистр command.stopCHREP анализируется только в режиме ЧРЭП
+          systemState.wasStopCHREP=0;
+          command.updateFromShadow=1;
+          if(systemState.curState==ENGINE_IDLE)
+          {
+            if(systemState.curMode==1)
+            {
+              systemState.curState=ENGINE_FAULT;               
+              systemState.startDisableCnt=0;                  
+              systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+              command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+            }else{
+              systemState.startDisableCnt=0; 
+              command.beepDelayBeforeStartIter=0;
+            }         
+          }            
+          if(systemState.curState==ENGINE_FAULT)
+          {
+            switch(systemState.curMode)
+            {
+              case 1: // Автозапуск возможен только в режиме "АВТО ЧРЭП"
+                 systemState.curState=ENGINE_FAULT;               
+                 systemState.startDisableCnt=0;                  
+                 systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                 command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+              break;
+              case 2:
+                if(systemState.kpStart)
+                {
+                  //systemState.kpStart=0; Чтобы двигатель пускался после сброса аварии  15.08.2017
+                  systemState.nextState=ENGINE_STOP;               
+                }     
+                systemState.curState=ENGINE_IDLE;
+                systemState.nextState=ENGINE_IDLE;                     
+              break;
+              case 3:
+                systemState.curState=ENGINE_IDLE;
+                systemState.nextState=ENGINE_IDLE; 
+                systemState.startDisableCnt=0; 
+                command.beepDelayBeforeStartIter=0;
+              break;             
+            }
+          }
+          if(systemState.curMode==3)
+          {
+            context.DI_state=0; 
+          }else context.DI_state=1;        
+        }
+        if(systemState.tempMode!=systemState.curMode) // Произошло изменение режима
+        {                                  
+          systemState.curMode=systemState.tempMode;
+          systemState.modeSwitchTimer=engine.freqPWM*3; // Задержка на 3 сек                             
+        }
+      }
+    }else{
+       if(systemState.curMode==3) // Для того, чтобы было известно состояние тумблера контекста при включении, иначе состояние становиться известным только при смене контекста 
+       {
+          context.DI_state=0; 
+       }else context.DI_state=1;      
+    }    
+    if(contextShadow.updateFromShadow==2) // Произошли изменения в настройках контекста по модбас   
+    { 
+      copymas((uint8_t*)&context,(uint8_t*)&contextShadow,CONTEXT_MODBUS_REGNUM*2);
+      contextShadow.updateFromShadow=0;
+    }           
+    if(commandShadow.updateFromShadow==2) // Произошли изменения в настройках двигателя по модбас   
+    {       
+      copymas((uint8_t*)&command,(uint8_t*)&commandShadow,COMMAND_MODBUS_REGNUM*2);  
+      commandShadow.updateFromShadow=0;
+    }             
+    if(engineShadow.updateFromShadow==2) // Произошли изменения в настройках двигателя по модбас   
+    {   
+      copymas((uint8_t*)&engine,(uint8_t*)&engineShadow,ENGINE_MODBUS_REGNUM*2);
+      for(uint8_t i=0;i<CONTEXT_NUM;i++)
+      {         
+        engine.C1[i]=engineShadow.C1[i];
+        engine.C2[i]=engineShadow.C2[i];
+        engine.k1[i]=engineShadow.k1[i];
+        engine.k2[i]=engineShadow.k2[i];      
+      }      
+      engineShadow.updateFromShadow=0;            
+      vectorPWMInit(engineShadow.freqPWM);      
+    }
+    if(command.faultsReset)
+    {
+      eventLogWrite(16);
+      faultCountersReset();            
+      if(systemState.curState==ENGINE_IDLE)
+      {
+        if(systemState.curMode==1)
+        {
+          systemState.curState=ENGINE_FAULT;               
+          systemState.startDisableCnt=0;                  
+          systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+          command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+        }         
+      }            
+      if(systemState.curState==ENGINE_FAULT)
+      {
+        switch(systemState.curMode)
+        {
+          case 1: // Автозапуск возможен только в режиме "АВТО ЧРЭП"
+            systemState.curState=ENGINE_FAULT;               
+            systemState.startDisableCnt=0;                  
+            systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+            command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+          break;
+          case 2:
+            if(systemState.kpStart)
+            {
+              //systemState.kpStart=0; Чтобы двигатель пускался после сброса аварии  15.08.2017              
+              systemState.nextState=ENGINE_STOP;               
+            }     
+            systemState.curState=ENGINE_IDLE;
+            systemState.nextState=ENGINE_IDLE;                     
+          break;
+          case 3:
+            systemState.curState=ENGINE_IDLE;
+            systemState.nextState=ENGINE_IDLE;                      
+          break;             
+        }
+      }
+      command.faultsReset=0;
+      command.updateFromShadow=1;
+    }
+    if(systemState.faults)
+    {
+       systemState.nextState=ENGINE_FAULT;  // Анализ на переход к аварии осуществляется только в этом месте
+    }else{
+      if(systemState.eventLogCurMode==0) // Режим работы еще не инициализирован
+      {
+        systemState.eventLogCurMode=systemState.curMode;
+        systemState.eventLogPrevMode=systemState.curMode;  
+      }else{
+        if(systemState.eventLogCurMode!=systemState.eventLogPrevMode)
+        {
+          eventLogWrite(17);
+          systemState.eventLogPrevMode=systemState.eventLogCurMode;
+        }   
+        systemState.eventLogCurMode=systemState.curMode;        
+      }      
+      switch(systemState.curMode)
+      {
+        case 1: // Режим "Автономный ЧРЭП"                     
+          switch(context.contextSource) 
+          {
+              case 0: // Модбас        
+                context.curContextNum=context.modbus_contextNum;                 
+              break;
+              case 1: // Состояния   ТС-1
+                if(context.DI_state==1)
+                {        
+                  context.curContextNum=context.DI0_1_contextNum;           
+                }else{       
+                  context.curContextNum=context.DI0_0_contextNum;
+                } 
+              break;
+          } 
+          if(command.workContextNum)
+          {
+            if(systemState.curState==ENGINE_READY)
+            {
+              if(command.workContextNum<=10)
+              {
+                context.curContextNum=command.workContextNum-1;
+              }
+            }                          
+          }         
+          switch(context.freqSource[context.curContextNum])  
+          {
+             case 0: // Источник частоты - модбас, уже и так выставляется по модбас, не корректировать     
+                if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                {                    
+                  systemState.desiredFreqOrRPM=command.desiredFreqOrRPM;
+                  setFreqRoutine(); 
+                }
+             break;
+             case 1: // Источник частоты - ТИТ1  
+               if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+               {                    
+                 titRoutine(0);
+                 if(adcInputs.Ready[0]==2)
+                 {   
+                   setFreqRoutine();
+                 }else systemState.desiredFreqOrRPM=0.0f;                  
+               }
+             break;
+             case 2: // Источник частоты - ТИТ2
+               if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+               {                    
+                 titRoutine(1);
+                 if(adcInputs.Ready[1]==2)
+                 {   
+                   setFreqRoutine();
+                 }else systemState.desiredFreqOrRPM=0.0f;                  
+               }                
+             break; 
+          }                        
+      if(context.prevContextNum!=context.curContextNum)
+      {
+        if(systemState.curState==ENGINE_READY)systemState.nextState=ENGINE_CONTEXT_CHANGE;
+        else if(systemState.curState==ENGINE_IDLE)context.prevContextNum=context.curContextNum;
+      }      
+      if((systemState.curState<ENGINE_STOP)&&(systemState.curState>ENGINE_IDLE)) // Выключать двигатель только если он работает, в режиме ЧРЭП это должно привести к останову выбегом и 
+      {                                                                          // исполнением процедуры автозапуска 
+        if(systemState.stateTC&0x0004) // Известно состояние кнопки "СТОП" (TC3)
+        {
+          if(systemState.dataTC&0x0004) // Двигатель запущен по кнопке "СТОП", импульсный сигнал    
+          {             
+            if(systemState.nextState!=ENGINE_FAULT) // Если не была зафиксирована авария
+            {
+              systemState.curState=ENGINE_FAULT;               
+              systemState.startDisableCnt=0;                                           
+              systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+              command.beepDelayBeforeStartIter=10*engine.freqPWM;            
+              vectorPWM.outputsCommand=2; // Останов выбегом
+              systemState.resetTC=0x8000;            
+            }
+          }
+        }        
+      }
+      if(command.stopCHREP) // Остановка двигателя с верхнего уровня, справедливо для режима ЧРЭП
+      {
+        // Произошел останов с ДП   
+        systemState.wasStopCHREP=1;
+        if(systemState.manualStart)systemState.nextState=ENGINE_STOP;
+        else systemState.nextState=ENGINE_IDLE;
+      }else{
+        if(systemState.wasStopCHREP) // Признак того, что был останов двигателя с верхнего уровня
+        {
+          systemState.curState=ENGINE_FAULT;               
+          systemState.startDisableCnt=0;                                           
+          systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+          command.beepDelayBeforeStartIter=10*engine.freqPWM;            
+          systemState.wasStopCHREP=0;
+        }      
+      }
+      break;
+      case 2:  // Режим "Автономный КП"                                                 
+              switch(context.contextSource) 
+              {
+                case 0: // Модбас        
+                  context.curContextNum=context.modbus_contextNum;
+                break;
+                case 1: // Состояния   ТС-1
+                  if(context.DI_state==1)
+                  {        
+                    context.curContextNum=context.DI0_1_contextNum;           
+                  }else{       
+                    context.curContextNum=context.DI0_0_contextNum;
+                  } 
+                break;
+              } 
+              if(command.workContextNum)
+              {
+                if(systemState.curState==ENGINE_READY)
+                {
+                  if(command.workContextNum<=10)
+                  {
+                    context.curContextNum=command.workContextNum-1;
+                  }
+                }                          
+              }              
+              if(systemState.stateTC&0x0002) // Известно состояние ТС2 - внешний пуск, его необходимо удерживать для продолжения работы
+              {
+                if(systemState.dataTC&0x0002) // Внешний пуск TC2
+                {                  
+                  //if(systemState.kpStart)
+                  //{ 
+                    if(systemState.curState==ENGINE_IDLE)
+                    {
+                      if(command.delayBeforeStartIter==0)
+                      {
+                        command.delayBeforeStartIter=command.delayBeforeStartKPSec*engine.freqPWM; 
+                      }
+                    }                    
+                    if(command.delayBeforeStartIter)command.delayBeforeStartIter--;                                                                    
+                    
+                    if(command.delayBeforeStartIter==0)
+                    {                      
+                      switch(context.freqSource[context.curContextNum]) 
+                      {
+                        case 0: // Источник частоты - модбас, уже и так выставляется по модбас, не корректировать       
+                          if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                          {                    
+                            systemState.desiredFreqOrRPM=command.desiredFreqOrRPM;
+                            setFreqRoutine(); 
+                          }
+                        break;
+                        case 1: // Источник частоты - ТИТ1  
+                          if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                          {                    
+                            titRoutine(0);
+                            if(adcInputs.Ready[0]==2)
+                            {   
+                              setFreqRoutine();
+                            }else systemState.desiredFreqOrRPM=0.0f;                  
+                          }
+                        break;
+                        case 2: // Источник частоты - ТИТ2
+                          if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                          {                    
+                            titRoutine(1);
+                            if(adcInputs.Ready[1]==2)
+                            {   
+                              setFreqRoutine();
+                            }else systemState.desiredFreqOrRPM=0.0f;                  
+                          }                
+                        break; 
+                      }
+                    }
+                  //}
+                }else{  
+                    command.delayBeforeStartIter=0;
+                    //systemState.kpStart=1;                    
+                   if(systemState.nextState!=ENGINE_IDLE)systemState.nextState=ENGINE_STOP;                  
+                }                                
+              }
+              if(context.prevContextNum!=context.curContextNum)
+              {
+                if(systemState.curState==ENGINE_READY)systemState.nextState=ENGINE_CONTEXT_CHANGE;
+                else if(systemState.curState==ENGINE_IDLE)context.prevContextNum=context.curContextNum;
+              }
+              if((systemState.curState<ENGINE_STOP)&&(systemState.curState>ENGINE_IDLE)) 
+              {
+                if(systemState.stateTC&0x0004) // Известно состояние кнопки "СТОП" (TC3)
+                {
+                  if(systemState.dataTC&0x0004) // Двигатель запущен по кнопке "СТОП", импульсный сигнал    
+                  {                
+                    //systemState.kpStart=0;
+                    systemState.nextState=ENGINE_STOP;                                     
+                  }
+                }         
+              }              
+          break;
+          case 3: // Режим "Ручной"            
+            switch(context.contextSource) 
+            {
+              case 0: // Модбас        
+                context.curContextNum=context.modbus_contextNum;
+              break;
+              case 1: // Состояния   ТС-1
+                if(context.DI_state==1)
+                {        
+                  context.curContextNum=context.DI0_1_contextNum;           
+                }else{       
+                  context.curContextNum=context.DI0_0_contextNum;
+                } 
+              break;
+            }                 
+            if(command.workContextNum)
+            {
+              if(systemState.curState==ENGINE_READY)
+              {
+                if(command.workContextNum<=10)
+                {
+                  context.curContextNum=command.workContextNum-1;
+                }
+              }                          
+            }                        
+            if(systemState.stateTC&0x0008) // Известно состояние кнопки "ПУСК" (TC4)
+            {
+              if(systemState.dataTC&0x0008) // Двигатель запущен по кнопке "ПУСК", импульсный сигнал  
+              {
+                if(systemState.startDisable==0) // Не реагировать на кнопку пуск до сброса ошибок
+                {
+                  if(systemState.skipDoublePress){;} // 
+                  else{
+                    systemState.skipDoublePress=3*engine.freqPWM/DI_DECIMATION;
+                    systemState.kpStart=1;
+                    systemState.manualStart=1;               
+                  }
+                }
+              }
+            }            
+         
+            if(systemState.manualStart)
+            {
+              switch(context.freqSource[context.curContextNum]) 
+              {
+                case 0: // Источник частоты - модбас, уже и так выставляется по модбас, не корректировать   
+                  if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                  {                    
+                    systemState.desiredFreqOrRPM=command.desiredFreqOrRPM;
+                    setFreqRoutine(); 
+                  }
+                break;
+                case 1: // Источник частоты - ТИТ1  
+                  if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                  {                    
+                    titRoutine(0);
+                    if(adcInputs.Ready[0]==2)
+                    {   
+                      setFreqRoutine();
+                    }else systemState.desiredFreqOrRPM=0.0f;                  
+                  }
+                break;
+                case 2: // Источник частоты - ТИТ2
+                  if((systemState.curState==ENGINE_READY)||(systemState.curState==ENGINE_IDLE))
+                  {                    
+                    titRoutine(1);
+                    if(adcInputs.Ready[1]==2)
+                    {   
+                      setFreqRoutine();
+                    }else systemState.desiredFreqOrRPM=0.0f;                  
+                  }                
+                break; 
+              }               
+            }
+            if(context.prevContextNum!=context.curContextNum)
+            {
+              if(systemState.curState==ENGINE_READY)systemState.nextState=ENGINE_CONTEXT_CHANGE;
+              else if(systemState.curState==ENGINE_IDLE)context.prevContextNum=context.curContextNum;
+            }            
+            
+            if(systemState.manualStart) // Выключать двигатель только если он работает
+            {
+              if(systemState.stateTC&0x0004) // Известно состояние кнопки "СТОП" (TC3)
+              {
+                if(systemState.dataTC&0x0004) // Двигатель запущен по кнопке "СТОП", импульсный сигнал    
+                {                
+                  systemState.nextState=ENGINE_STOP;                  
+                }
+              }
+            }
+          break;      
+        }  
+    }
+    systemState.tempMode=systemState.curMode;
+    uint32_t tempUINT32;
+    switch(systemState.curState)
+    {
+       case ENGINE_IDLE: // Простой двигателя, может быть только при включении и остановке выбегом        
+         switch(systemState.nextState)
+         {       
+           case ENGINE_IDLE: // Ничего не делать, ЧРЭП находится в состоянии покоя 
+           break;           
+           case ENGINE_UP: // Разгон, после простоя, мгновенный переход к разгону   
+             if(systemState.startDisable) // Запрет пуска
+             {
+               systemState.nextState=ENGINE_IDLE;  
+             }else{ 
+               uint8_t norm=1;
+               if(etrEngine.overloadCnt>(etrEngine.overloadLimit*(float)etrEngine.normalConditionsPercent/100.0f))
+               {
+                 norm=0;                 
+                 systemState.manualStart=0;
+                 //systemState.kpStart=0;
+                 systemState.nextState=ENGINE_IDLE;  
+                 systemState.etrHoldON=1;
+                 FAULT_OPTO_OUT(1);
+               }else{
+                 if(systemState.etrHoldON)
+                 {
+                   norm=0;
+                   systemState.curState=ENGINE_FAULT;               
+                   systemState.startDisableCnt=0;    
+                   if(systemState.curMode==1)
+                   {
+                     systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                     command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+                   }else{
+                     systemState.startDisableCnt=1*engine.freqPWM; // Задержка перед автопуском на 1 сек
+                     command.beepDelayBeforeStartIter=0; // Нет пищалки
+                   } 
+                   systemState.etrHoldON=0;
+                 }
+               }               
+               if((tempSensor[0].curTemp>=alarms.internalTemperatureNORM)||(tempSensor[1].curTemp>=alarms.radiatorTemperatureNORM))
+               {
+                 norm=0;                 
+                 systemState.manualStart=0;
+                 //systemState.kpStart=0;
+                 systemState.nextState=ENGINE_IDLE;
+                 FAULT_OPTO_OUT(1);
+                 systemState.tempHoldON=1;
+               }else{
+                 if(systemState.tempHoldON)
+                 {
+                   norm=0;
+                   systemState.curState=ENGINE_FAULT;               
+                   systemState.startDisableCnt=0;    
+                   if(systemState.curMode==1)
+                   {
+                     systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                     command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+                   }else{
+                     systemState.startDisableCnt=1*engine.freqPWM; // Задержка перед автопуском на 1 сек
+                     command.beepDelayBeforeStartIter=0; // Нет пищалки
+                   }
+                   systemState.tempHoldON=0;
+                 }
+               }               
+              
+               if(pidVoltage.Udc<Uunfix) 
+               {
+                 norm=0;                 
+                 systemState.thyristorON=0;
+                 systemState.manualStart=0;
+                 //systemState.kpStart=0;
+                 systemState.nextState=ENGINE_IDLE;
+                 FAULT_OPTO_OUT(1);
+               }else{
+                 if(systemState.thyristorON==0)
+                 {
+                   norm=0;
+                   systemState.curState=ENGINE_FAULT;               
+                   systemState.startDisableCnt=0;    
+                   if(systemState.curMode==1)
+                   {
+                     systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                     command.beepDelayBeforeStartIter=10*engine.freqPWM;                
+                   }else{
+                     systemState.startDisableCnt=1*engine.freqPWM; // Задержка перед автопуском на 1 сек, чтобы не сгорел резистор в процессе выключения...
+                     command.beepDelayBeforeStartIter=0; // Нет пищалки
+                   }
+                   THYRISTOR_ON(1);
+                   RCHARGE_ON(1);
+                   //FAN_ON(1);     <--- теперь управление по датчику температуры радиатора              
+                   systemState.thyristorON=1;
+                 }
+               }
+               
+               if(norm)
+               {
+                 if(shortCurrentCheck) // Проверка на к.з. перед пуском
+                 {                   
+                   switch(shortCurrentCheck)
+                   {
+                     case 1:
+                       switchPWMtoDO();
+                       A(0);nA(0);B(0);nB(0);C(0);nC(0);
+                     break;
+                     case 2:
+                       F_RESET();                        
+                     break;
+                     case 3:
+                       A(1);B(1);C(1);
+                     break;
+                     case 4:
+                       A(0);B(0);C(0);
+                     break;
+                     case 104:
+                       nA(1);nB(1);nC(1);
+                     break;
+                     case 105:
+                       nA(0);nB(0);nC(0);
+                     break;  
+                     case 205:
+                       A(1);nB(1);
+                     break;
+                     case 206:
+                       A(0);nB(0);
+                     break;
+                     case 306:
+                       A(1);nC(1);
+                     break;
+                     case 307:
+                       A(0);nC(0);
+                     break;
+                     case 408:
+                       B(1);nC(1);
+                     break;
+                     case 409:
+                       B(0);nC(0);
+                     break;                          
+                   }                     
+                   shortCurrentCheck++;
+                   if(shortCurrentCheck>509)
+                   {
+                     switchDOtoPWM(); 
+                     shortCurrentCheck=0;
+                   }
+                 }else{                   
+                   if((command.freeRunTimeMS==0)||(regularStart)) // Обычный пуск, без режима подхвата частоты
+                   {  
+                     regularStart=0;                              
+                     FAULT_OPTO_OUT(0);
+                     context.Ts=context.curveStimeUP[context.prevContextNum];
+                     context.Ts_d=(uint32_t)(context.Ts*(float)engine.freqPWM);              
+                     if(context.startFreq[context.prevContextNum]>=systemState.desiredFreqOrRPM) // Начинаем с нулевой частоты
+                     {                       
+                       vectorPWM.curDeltaPhiIntegral=engine.minFreq*(float)engine.freqPWM;
+                       context.Tl=systemState.desiredFreqOrRPM/context.dfdtUP[context.prevContextNum];
+                       context.Tl_d=(uint32_t)(context.Tl*(float)engine.freqPWM);                               
+                       context.aConst=(2.0f*systemState.desiredFreqOrRPM)/((context.Ts+2.0f*context.Tl));                
+                       if(context.Ts>0.0f)context.K=4.0f*(systemState.desiredFreqOrRPM-context.aConst*context.Tl)/(context.Ts*context.Ts*(float)engine.freqPWM);                                
+                       else context.K=0.0f;
+                     }else{              
+                       vectorPWM.curDeltaPhiIntegral=context.startFreq[context.prevContextNum]*(float)engine.freqPWM;
+                       context.Tl=(systemState.desiredFreqOrRPM-context.startFreq[context.prevContextNum])/context.dfdtUP[context.prevContextNum];
+                       context.Tl_d=(uint32_t)(context.Tl*(float)engine.freqPWM);                
+                       context.aConst=(2.0f*(systemState.desiredFreqOrRPM-context.startFreq[context.prevContextNum])/(context.Ts+2.0f*context.Tl));
+                       if(context.Ts>0.0f)context.K=4.0f*(systemState.desiredFreqOrRPM-context.startFreq[context.prevContextNum]-context.aConst*context.Tl)/(context.Ts*context.Ts*(float)engine.freqPWM);                
+                       else context.K=0.0f;
+                     }                               
+                     context.linkConst=context.K*(context.Tl_d+context.Ts_d);                    
+                     context.sample=0;                                 
+                     systemState.curState=ENGINE_UP;
+                     vectorPWM.outputsCommand=1;                 
+                     measurements.maxIstartValueTemp=0;
+                     measurements.maxIstartFlag=1;
+                     command.powerStabSum=0.0f;                     
+                     pidVoltage.pwmCorrection=0; // Сбросить добавку по индексу модуляции
+                     stabState=0;                // Не ограничивать изменение фазы на первом такте ШИМ  
+                     command.startCurrentFreezeTrigger=0; // Триггер для ограничения стартового тока
+                     command.startCurrentFreezeTimer=0;   // Таймер для ограничения длительности "заморозки" частоты 
+                     //shortCurrentCheck=1; // Во время следующего пуска проверять выходы ЧРЭП на к.з.
+                   }else{ // Пуск с подхватом частоты
+                     vectorPWM.curDeltaPhi=engine.maxFreq/(float)engine.freqPWM; // Поиск начинаем с максимальной частоты двигателя
+                     vectorPWM.amplitudePWM=0;//command.freeRunUfmax*86;//32767.0f/380.0f~=86.2 - Действующее напряжение преобразуем в ШИМ                                           
+                     context.voltageShiftSum=0.0f;                     
+                     context.voltageShiftSamples=(int32_t)((float)((int32_t)engine.freqPWM*(int32_t)command.freeRunUfmax)/(float)context.voltageShiftTime);                                             
+                     context.voltageShiftInc=86.2f*(float)command.freeRunUfmax/(float)context.voltageShiftSamples;                     
+                     context.sample=0;                                
+                     vectorPWM.ddPhi=vectorPWM.curDeltaPhi/((float)((int32_t)command.freeRunTimeMS*(int32_t)engine.freqPWM)/1000.0f);                                          
+                     command.freeRunState=1;
+                     systemState.curState=ENGINE_UP;
+                     systemState.nextState=ENGINE_FREE_RUN;
+                     pidVoltage.pwmCorrection=0; 
+                     vectorPWM.outputsCommand=1; 
+                   }
+                 }
+               }
+             }
+           break;
+           case ENGINE_DOWN: // Торможение, не может быть из состояния простоя, пропуск этого состояния, готов к исполнению следующего состояния                			  
+             systemState.nextState=ENGINE_IDLE;
+           break;              
+           case ENGINE_CONTEXT_CHANGE: // Смена контекста, двигатель не вращается, следовательно нет необходимости плавно изменять напряжение                                              
+             systemState.nextState=ENGINE_IDLE;
+             
+           break;
+           case ENGINE_READY: // Переход в данное состояние невозможен
+             systemState.nextState=ENGINE_IDLE;
+           break;
+           case ENGINE_STOP: // ШИМ итак не работает 
+             systemState.nextState=ENGINE_IDLE;
+             command.currentFreqOrRPM=0.0f;              
+           break;   
+           case ENGINE_FAULT: // Ошибка произошла, когда ШИМ не работал, сделать обработчик аварий, текущее состояние - авария                      
+             systemState.curState=ENGINE_FAULT;       
+             vectorPWM.outputsCommand=2;
+             FAULT_OPTO_OUT(1);
+             systemState.startDisable=0;
+             dynaGramAlarmFlag=0;
+             for(uint8_t i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+             {
+               if(systemState.faults&(1<<i))  
+               {
+                 if(faultEventAdd(i)) // Проверить, есть ли попытки для автозапуска...
+                 {                          
+                   systemState.startDisable|=1; // Запретить запуски
+                 }else{
+                   if(i>=7)dynaGramAlarmFlag=1;                              
+                 }                 
+               }
+             }
+             if(systemState.startDisable==0)
+             {               
+               systemState.startDisableCnt=0;
+               if((systemState.curMode==1)||(systemState.curMode==2)) // Автозапуск для режима КП
+               {                 
+                 if(dynaGramAlarmFlag)systemState.startDisableCnt=((uint32_t)dynaGram.afterAlarmDelayMin*(uint32_t)engine.freqPWM*60L); // Задержка перед автопуском после аварии по динамографу
+                 else systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                 command.beepDelayBeforeStartIter=10*engine.freqPWM;                  
+               }else systemState.startDisableCnt=1;               
+             }                     
+             systemState.faults=0; // Сброс флагов необработанных текущих аварий
+           break;                  
+           default:
+             systemState.nextState=ENGINE_IDLE;             
+           break;                  
+         }  
+       break;
+       case ENGINE_UP:                  
+                 switch(systemState.nextState)
+                 {  
+                   case ENGINE_IDLE: // В данное состояние из ENGINE_UP нельзя перейти 
+                     systemState.nextState=ENGINE_UP;
+                   break;
+                   case ENGINE_UP: // Происходит процесс разгона
+                     tempUINT32=context.Ts_d/2;
+                     if(command.startCurrentFreezeTrigger==0)
+                     {
+                       if(context.sample<=tempUINT32) 
+                       {
+                         vectorPWM.curDeltaPhiIntegral+=context.K*(float)context.sample;
+                       }else{
+                          if(context.sample<=(tempUINT32+context.Tl_d))
+                          {
+                            vectorPWM.curDeltaPhiIntegral+=context.aConst;
+                          }else{
+                             if(context.sample<(context.Ts_d+context.Tl_d))
+                             {
+                               vectorPWM.curDeltaPhiIntegral+=context.linkConst-context.K*(float)context.sample; 
+                             }else{
+                               command.currentFreqOrRPM=systemState.desiredFreqOrRPM;
+                               commandShadow.currentFreqOrRPM=command.currentFreqOrRPM;
+                               vectorPWM.curDeltaPhi=systemState.desiredFreqOrRPM/(float)engine.freqPWM; // Из-за накопления ошибки интегрирования - конечную частоту лучше корректировать                               
+                               systemState.curState=ENGINE_READY;
+                               systemState.nextState=ENGINE_READY; 
+                               measurements.maxIstartFlag=0;
+                             }             
+                          }
+                       }
+                     }
+                     
+                     if(systemState.nextState==ENGINE_UP) // Процесс разгона не закончился...
+                     {
+                       vectorPWM.curDeltaPhi=vectorPWM.curDeltaPhiIntegral/(float)(engine.freqPWM*engine.freqPWM);                       
+                       if(command.startCurrentFreezeMS) // Включен режим ограничения пускового тока
+                       {
+                         if(command.startCurrentFreezeTrigger==0)
+                         {
+                           if(measurements.Irms>(command.startCurrentFreezeHigh*100))
+                           {
+                             command.startCurrentFreezeTrigger=1;
+                           }
+                         }                         
+                         if(command.startCurrentFreezeTrigger)// Частота "заморожена"
+                         {
+                           command.startCurrentFreezeTimer++;
+                           if(command.startCurrentFreezeTimer>((command.startCurrentFreezeMS*engine.freqPWM)/1000))
+                           {                           
+                             DRIVER_STOP(1);          
+                             eventLogWrite(24);
+                             alarms.faultBitsExtended|=0x0020;            
+                             vectorPWM.outputsCommand=2;                                 
+                             systemState.faults=(1L<<BRIDGE_SATURATION_FAULT);                                     
+                             FAULT_OPTO_OUT(1);                               
+                           }
+                           if(measurements.Irms<(command.startCurrentFreezeLow*100))
+                           {
+                             command.startCurrentFreezeTrigger=0;
+                           }                           
+                         }else context.sample++;                            
+                       }else context.sample++;                   
+                     }                     
+                   break;
+                   case ENGINE_FREE_RUN: // Режим поиска частоты              
+                     if(command.freeRunState==1)
+                     {
+                       if(context.sample<context.voltageShiftSamples) 
+                       {
+                         context.voltageShiftSum+=context.voltageShiftInc;
+                         vectorPWM.amplitudePWM=(int16_t)context.voltageShiftSum;
+                         context.sample++; 
+                       }else{
+                         vectorPWM.curDeltaPhi=vectorPWM.curDeltaPhi-vectorPWM.ddPhi;                      
+                         if(vectorPWM.curDeltaPhi>0.0f) // Перебирать частоты до смены направления вращения
+                         {
+                           if(measurements.scalarProduct<0) // Частота вращения ротора определена, развить полный момент двигателя в соотв. с U(f)
+                           {
+                             //context.voltageShiftSum=0.0f;                          
+                             vectorPWM.newAmplitudePWM=U_f_dependancy(vectorPWM.curDeltaPhi); // Текущая частота статора
+                             context.voltageShiftSamples=(int32_t)(0.0116f*(float)((uint32_t)engine.freqPWM*(uint32_t)(vectorPWM.newAmplitudePWM-vectorPWM.amplitudePWM))/(float)context.voltageShiftTime);                     
+                             context.voltageShiftInc=(float)(vectorPWM.newAmplitudePWM-vectorPWM.amplitudePWM)/(float)context.voltageShiftSamples;                                      
+                              if(context.voltageShiftSamples<0)context.voltageShiftSamples=-context.voltageShiftSamples;
+                             context.sample=0;
+                             command.freeRunState=2;
+                           }
+                         }else{  // Если не получилось, то просто пустить двигатель
+                            regularStart=1;
+                            shortCurrentCheck=0;
+                            command.freeRunState=0;
+                            systemState.curState=ENGINE_IDLE;
+                            systemState.nextState=ENGINE_UP;                             
+                         }                     
+                       }
+                     }else{
+                       if(context.sample<context.voltageShiftSamples) 
+                       {
+                         context.voltageShiftSum+=context.voltageShiftInc;
+                         vectorPWM.amplitudePWM=(int16_t)context.voltageShiftSum;
+                         context.sample++; 
+                       }else{ 
+                         command.freeRunState=0;
+                         command.currentFreqOrRPM=vectorPWM.curDeltaPhi*(float)engine.freqPWM;
+                         systemState.curState=ENGINE_READY;
+                         systemState.nextState=ENGINE_READY;                          
+                       }                    
+                     }
+                   break;
+                   case ENGINE_DOWN: // В данное состояние нельзя перейти из ENGINE_UP, минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_UP;
+                   break;
+                   case ENGINE_CONTEXT_CHANGE: // В данное состояние нельзя перейти из ENGINE_UP, минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_UP;
+                   break;           
+                   case ENGINE_READY: // В данное состояние нельзя перейти из ENGINE_UP минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_UP;
+                   break;
+                   case ENGINE_STOP:  // Во время разгона есть возможность осуществить останов двигателя                       
+                        systemState.curState=ENGINE_IDLE; 
+                        systemState.nextState=ENGINE_IDLE; 
+                        eventLogWrite(15);
+                        vectorPWM.outputsCommand=2;
+                        systemState.resetTC=0x8000;
+                        measurements.maxIstartFlag=0;
+                   break;
+                   case ENGINE_FAULT:// Ошибка произошла, во время разгона, сделать обработчик аварий, текущее состояние - авария                                   
+                       systemState.curState=ENGINE_FAULT;       
+                       vectorPWM.outputsCommand=2;
+                       FAULT_OPTO_OUT(1);
+                       systemState.startDisable=0;
+                       measurements.maxIstartFlag=0;
+                       dynaGramAlarmFlag=0;
+                       for(uint8_t i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+                       {
+                         if(systemState.faults&(1<<i))  
+                         {
+                           if(faultEventAdd(i)) // Проверить, есть ли попытки для автозапуска...
+                           {                          
+                             systemState.startDisable|=1; // Запретить запуски
+                           }else{
+                             if(i>=7)dynaGramAlarmFlag=1;                              
+                           }                           
+                         }
+                       }
+                       if(systemState.startDisable==0)
+                       {               
+                         //systemState.startDisableCnt=0;
+                         if((systemState.curMode==1)||(systemState.curMode==2)) // Автозапуск для режима КП
+                         {                           
+                           if(dynaGramAlarmFlag)systemState.startDisableCnt=((uint32_t)dynaGram.afterAlarmDelayMin*(uint32_t)engine.freqPWM*60L); // Задержка перед автопуском после аварии по динамографу
+                           else systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                           command.beepDelayBeforeStartIter=10*engine.freqPWM;                            
+                         }else systemState.startDisableCnt=1;               
+                       }                     
+                       systemState.faults=0; // Сброс флагов необработанных текущих аварий                     
+                   break;  
+                   default: 
+                     systemState.nextState=ENGINE_UP;                     
+                   break;             
+                 }       
+       break;
+       case ENGINE_DOWN:                
+                 switch(systemState.nextState)
+                 {  
+                   case ENGINE_IDLE: // В данное состояние из ENGINE_DOWN нельзя перейти 
+                     systemState.nextState=ENGINE_DOWN;
+                   break;
+                   case ENGINE_UP: // В данное состояние нельзя перейти из ENGINE_DOWN, минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_DOWN;
+                   break;
+                   case ENGINE_DOWN: // Происходит процесс уменьшения скорости вращения
+                     tempUINT32=context.Ts_d/2;
+                     if(context.sample<=tempUINT32)
+                     {
+                       vectorPWM.curDeltaPhiIntegral+=context.K*(float)context.sample;
+                     }else{
+                        if(context.sample<=(tempUINT32+context.Tl_d))
+                        {
+                          vectorPWM.curDeltaPhiIntegral+=context.aConst;
+                        }else{
+                           if(context.sample<(context.Ts_d+context.Tl_d))
+                           {
+                             vectorPWM.curDeltaPhiIntegral+=context.linkConst-context.K*(float)context.sample; 
+                           }else{
+                             command.currentFreqOrRPM=systemState.desiredFreqOrRPM;
+                             commandShadow.currentFreqOrRPM=command.currentFreqOrRPM;
+                             vectorPWM.curDeltaPhi=systemState.desiredFreqOrRPM/(float)engine.freqPWM; // Из-за накопления ошибки интегрирования - конечную частоту лучше корректировать
+                             systemState.curState=ENGINE_READY;
+                             systemState.nextState=ENGINE_READY;                                                           
+                           }             
+                        }
+                     }
+                     if(systemState.nextState==ENGINE_DOWN)vectorPWM.curDeltaPhi=vectorPWM.curDeltaPhiIntegral/(float)(engine.freqPWM*engine.freqPWM);
+                     context.sample++;                     
+                   break;
+                   case ENGINE_CONTEXT_CHANGE: // В данное состояние нельзя перейти из ENGINE_DOWN, минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_DOWN;
+                   break;           
+                   case ENGINE_READY: // В данное состояние нельзя перейти из ENGINE_DOWN минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_DOWN;                     
+                   break;
+                   case ENGINE_STOP:  // Во время разгона есть возможность осуществить останов двигателя
+                     // Сделать паузу при повторном пуске
+                     systemState.curState=ENGINE_IDLE; 
+                     systemState.nextState=ENGINE_IDLE;
+                     eventLogWrite(15);
+                     vectorPWM.outputsCommand=2;
+                     systemState.resetTC=0x8000;                    
+                   break;
+                   case ENGINE_FAULT:// Ошибка произошла, во время разгона, сделать обработчик аварий, текущее состояние - авария                                   
+                     systemState.curState=ENGINE_FAULT;       
+                     vectorPWM.outputsCommand=2;
+                     FAULT_OPTO_OUT(1);
+                     systemState.startDisable=0;
+                     dynaGramAlarmFlag=0;
+                     for(uint8_t i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+                     {
+                       if(systemState.faults&(1<<i))  
+                       {                        
+                         if(faultEventAdd(i)) // Проверить, есть ли попытки для автозапуска...
+                         {                          
+                           systemState.startDisable|=1; // Запретить запуски
+                         }else{
+                           if(i>=7)dynaGramAlarmFlag=1;                            
+                         }                         
+                       }
+                     }
+                     if(systemState.startDisable==0)
+                     {               
+                       //systemState.startDisableCnt=0;
+                       if((systemState.curMode==1)||(systemState.curMode==2)) // Автозапуск для режима КП
+                       {                        
+                         if(dynaGramAlarmFlag)systemState.startDisableCnt=((uint32_t)dynaGram.afterAlarmDelayMin*(uint32_t)engine.freqPWM*60L); // Задержка перед автопуском после аварии по динамографу
+                         else systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                         command.beepDelayBeforeStartIter=10*engine.freqPWM;                         
+                       }else systemState.startDisableCnt=1;               
+                     }                     
+                     systemState.faults=0; // Сброс флагов необработанных текущих аварий
+                   break;  
+                   default:
+                     systemState.nextState=ENGINE_DOWN;                     
+                   break;             
+                 }          
+       break;
+       case ENGINE_CONTEXT_CHANGE:
+                 switch(systemState.nextState)
+                 {  
+                   case ENGINE_IDLE: // В данное состояние из ENGINE_CONTEXT_CHANGE нельзя перейти 
+                     systemState.nextState=ENGINE_CONTEXT_CHANGE;
+                   break;
+                   case ENGINE_UP: // В данное состояние нельзя перейти из ENGINE_CONTEXT_CHANGE, минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_CONTEXT_CHANGE;
+                   break;
+                   case ENGINE_DOWN: // В данное состояние нельзя перейти из ENGINE_CONTEXT_CHANGE, минуя ENGINE_READY             
+                     systemState.nextState=ENGINE_CONTEXT_CHANGE;
+                   break;
+                   case ENGINE_CONTEXT_CHANGE: // Происходит изменение напряжения при смене контекста                    
+                   break;           
+                   case ENGINE_READY: // В данное состояние нельзя перейти из ENGINE_CONTEXT_CHANGE
+                     systemState.nextState=ENGINE_CONTEXT_CHANGE;
+                   break;
+                   case ENGINE_STOP:  // Во время смены контекста есть возможность осуществить останов двигателя
+                        // Сделать паузу при повторном пуске
+                        systemState.curState=ENGINE_IDLE; 
+                        systemState.nextState=ENGINE_IDLE;  
+                        eventLogWrite(15);
+                        vectorPWM.outputsCommand=2;
+                        systemState.resetTC=0x8000;                        
+                   break;
+                   case ENGINE_FAULT:// Ошибка произошла, во время разгона, сделать обработчик аварий, текущее состояние - авария                                                       
+                         systemState.curState=ENGINE_FAULT;       
+                         vectorPWM.outputsCommand=2;
+                         FAULT_OPTO_OUT(1);
+                         systemState.startDisable=0;
+                         dynaGramAlarmFlag=0;
+                         for(uint8_t i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+                         {
+                           if(systemState.faults&(1<<i))  
+                           {
+                             //if(systemState.curMode!=3)
+                             //{
+                             if(faultEventAdd(i)) // Проверить, есть ли попытки для автозапуска...
+                             {                          
+                               systemState.startDisable|=1; // Запретить запуски
+                             }else{
+                               if(i>=7)dynaGramAlarmFlag=1;                            
+                             }
+                             //}else forceBVI(i, 3);
+                           }
+                         }
+                         if(systemState.startDisable==0)
+                         {               
+                           //systemState.startDisableCnt=0;
+                           if((systemState.curMode==1)||(systemState.curMode==2)) // Автозапуск для режима КП
+                           {                             
+                             if(dynaGramAlarmFlag)systemState.startDisableCnt=((uint32_t)dynaGram.afterAlarmDelayMin*(uint32_t)engine.freqPWM*60L); // Задержка перед автопуском после аварии по динамографу
+                             else systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском  
+                             command.beepDelayBeforeStartIter=10*engine.freqPWM;                              
+                           }else systemState.startDisableCnt=1;               
+                         }                     
+                         systemState.faults=0; // Сброс флагов необработанных текущих аварий
+                   break;  
+                   default:
+                     systemState.nextState=ENGINE_CONTEXT_CHANGE;                    
+                   break;             
+                 }            
+       break;       
+       case ENGINE_READY: // Двигатель вращается, ЧРЭП готов выполнить новую команду по изменению частоты                
+                 switch(systemState.nextState)
+                 {  	
+                   case ENGINE_IDLE: // Переход в такое состояние запрещен
+                     systemState.nextState=ENGINE_READY;
+                   break;
+                   case ENGINE_UP: // Мгновенный переход к разгону, двигатель уже вращается                                         
+                     vectorPWM.curDeltaPhiIntegral=command.currentFreqOrRPM*(float)engine.freqPWM;
+                     context.Ts=context.curveStimeUP[context.prevContextNum];
+                     context.Ts_d=(uint32_t)(context.Ts*(float)engine.freqPWM);                                    
+                     context.Tl=(systemState.desiredFreqOrRPM-command.currentFreqOrRPM)/context.dfdtUP[context.prevContextNum];
+                     context.Tl_d=(uint32_t)(context.Tl*(float)engine.freqPWM);                
+                     context.aConst=(2.0f*(systemState.desiredFreqOrRPM-command.currentFreqOrRPM)/(context.Ts+2.0f*context.Tl));
+                     if(context.Ts>0.0f)context.K=4.0f*(systemState.desiredFreqOrRPM-command.currentFreqOrRPM-context.aConst*context.Tl)/(context.Ts*context.Ts*(float)engine.freqPWM);                
+                     else context.K=0.0f;                  
+                     context.linkConst=context.K*(context.Tl_d+context.Ts_d);                    
+                     context.sample=0;                  
+                     systemState.curState=ENGINE_UP;                       
+                   break;
+                   case ENGINE_DOWN:                   
+                     vectorPWM.curDeltaPhiIntegral=command.currentFreqOrRPM*(float)engine.freqPWM;                     
+                     context.Ts=context.curveStimeDOWN[context.prevContextNum];
+                     context.Ts_d=(uint32_t)(context.Ts*(float)engine.freqPWM);                                      
+                     context.Tl=(command.currentFreqOrRPM-systemState.desiredFreqOrRPM)/context.dfdtDOWN[context.prevContextNum];
+                     context.Tl_d=(uint32_t)(context.Tl*(float)engine.freqPWM);                
+                     context.aConst=(2.0f*(systemState.desiredFreqOrRPM-command.currentFreqOrRPM)/(context.Ts+2.0f*context.Tl));
+                     if(context.Ts>0.0f)context.K=4.0f*(systemState.desiredFreqOrRPM-command.currentFreqOrRPM-context.aConst*context.Tl)/(context.Ts*context.Ts*(float)engine.freqPWM);                
+                     else context.K=0.0f;                  
+                     context.linkConst=context.K*(context.Tl_d+context.Ts_d);                    
+                     context.sample=0;                                   
+                     systemState.curState=ENGINE_DOWN;                      
+                   break;              
+                   case ENGINE_CONTEXT_CHANGE: // Смена контекста                          
+                     vectorPWM.lastAmplitudePWM=vectorPWM.amplitudePWM;             // Последнее значение ШИМ, связанное с напряжением ШИМ, до переключения контекста
+                     context.prevContextNum=context.curContextNum;
+                     vectorPWM.newAmplitudePWM=U_f_dependancy(vectorPWM.curDeltaPhi);  // Новое значение ШИМ, связанное с напряжением ШИМ, после переключения контекста                                                                                                       
+                     if(context.voltageShiftTime)context.voltageShiftSamples=380*engine.freqPWM*(vectorPWM.newAmplitudePWM-vectorPWM.lastAmplitudePWM)/(32767*context.voltageShiftTime);                     
+                     else context.voltageShiftSamples=1;                        
+                     systemState.curState=ENGINE_CONTEXT_CHANGE;
+                     context.sample=0;           
+                     context.voltageShiftSum=vectorPWM.amplitudePWM;
+                     if(context.voltageShiftSamples<0)context.voltageShiftSamples=-context.voltageShiftSamples;
+                     if(context.voltageShiftSamples)context.voltageShiftInc=(float)(vectorPWM.newAmplitudePWM-vectorPWM.lastAmplitudePWM)/(float)context.voltageShiftSamples;                      
+                     else{systemState.nextState=ENGINE_READY;} // Если другой контекст при переходе имеет такое же напряжение, то ничего не делать
+                   break;
+                   case ENGINE_READY: // Двигатель готов к выполнению новых команд, состояния не менять 
+                   break;
+                   case ENGINE_STOP: 
+                     systemState.curState=ENGINE_IDLE;
+                     systemState.nextState=ENGINE_IDLE;  
+                     eventLogWrite(15);
+                     vectorPWM.outputsCommand=2;
+                     systemState.resetTC=0x8000;                     
+                   break;   
+                   case ENGINE_FAULT: 
+                     systemState.curState=ENGINE_FAULT;       
+                     vectorPWM.outputsCommand=2;
+                     FAULT_OPTO_OUT(1);
+                     systemState.startDisable=0;
+                     dynaGramAlarmFlag=0;
+                     for(uint8_t i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+                     {
+                       if(systemState.faults&(1<<i))  
+                       {
+                         if(faultEventAdd(i)) // Проверить, есть ли попытки для автозапуска...
+                         {                          
+                           systemState.startDisable|=1; // Запретить запуски
+                         }else{
+                           if(i>=7)dynaGramAlarmFlag=1;                                     
+                         }                      
+                       }
+                     }
+                     if(systemState.startDisable==0)
+                     {               
+                       //systemState.startDisableCnt=0;
+                       if((systemState.curMode==1)||(systemState.curMode==2)) // Автозапуск для режима КП
+                       {
+                         if(dynaGramAlarmFlag)systemState.startDisableCnt=((uint32_t)dynaGram.afterAlarmDelayMin*(uint32_t)engine.freqPWM*60L); // Задержка перед автопуском после аварии по динамографу
+                         else systemState.startDisableCnt=command.delayBeforeRestartSec*engine.freqPWM; // Задержка перед автопуском 
+                         command.beepDelayBeforeStartIter=10*engine.freqPWM;                          
+                       }else systemState.startDisableCnt=1;               
+                     }                     
+                     systemState.faults=0; // Сброс флагов необработанных текущих аварий
+                   break;                  
+                   default: 
+                     systemState.nextState=ENGINE_READY;                     
+                   break;   
+                 }			
+                 break;
+         case ENGINE_STOP:  // Сюда алгоритм заходить не должен, на всякий случай задам состояния...
+           systemState.curState=ENGINE_IDLE; 
+           systemState.nextState=ENGINE_IDLE;                           
+           vectorPWM.outputsCommand=2;
+           systemState.resetTC=0x8000;
+         break;
+         case ENGINE_FAULT: // Система находится в состоянии аварии, указать возможные выходы из состояния                     
+           if(systemState.startDisable==0) // Запустить счетчик автозапуска...
+           {             
+             systemState.startDisableCnt--;             
+             if(systemState.startDisableCnt==0) 
+             {               
+               FAULT_OPTO_OUT(0);
+               //F_RESET();
+               systemState.resetTC=0x8000;
+               switch(systemState.curMode)
+               {
+                 case 1: // Автозапуск возможен только в режиме "АВТО ЧРЭП"
+                   systemState.curState=ENGINE_IDLE;
+                   systemState.nextState=ENGINE_IDLE;                    
+                 break;
+                 case 2:
+                    if(systemState.kpStart)
+                    {
+                      systemState.kpStart=0;
+                      systemState.nextState=ENGINE_STOP;               
+                    }     
+                     systemState.curState=ENGINE_IDLE;
+                     systemState.nextState=ENGINE_IDLE;                         
+                 break;
+                 case 3:
+                     systemState.curState=ENGINE_IDLE;
+                     systemState.nextState=ENGINE_IDLE;                     
+                 break;             
+               }         
+             }
+           }
+         break;  
+       }  
+     
+    if(command.testMode==1) // Тестовый режим - установленная частота выставляется мгновенно, а напряжение в соответствии с параметрами разгона/торможения
+    {       
+      vectorPWM.amplitudePWM=U_f_dependancy(vectorPWM.curDeltaPhi);   
+      command.testModeDeltaPhi=systemState.desiredFreqOrRPM/(float)engine.freqPWM;
+    }else{
+      if(systemState.curState==ENGINE_CONTEXT_CHANGE)
+      {
+        context.voltageShiftSum+=context.voltageShiftInc;
+        vectorPWM.amplitudePWM=(int16_t)context.voltageShiftSum;
+        context.sample++;
+        if(context.sample>=context.voltageShiftSamples)
+        {        
+          vectorPWM.amplitudePWM=vectorPWM.newAmplitudePWM;                        
+          systemState.curState=ENGINE_READY;
+          systemState.nextState=ENGINE_READY;                          
+        }  
+      }else{
+        if(systemState.nextState!=ENGINE_FREE_RUN)vectorPWM.amplitudePWM=U_f_dependancy(vectorPWM.curDeltaPhi);   
+      }
+    }    
+    if(vectorPWM.currentPhi>32767)vectorPWM.currentPhi=32767;
+    if(vectorPWM.currentPhi<G60){vectorPWM.sector=0;vectorPWM.dop=0.0;}
+    else{
+      if(vectorPWM.currentPhi<G120){vectorPWM.sector=1;vectorPWM.dop=G60;}
+      else{
+        if(vectorPWM.currentPhi<G180){vectorPWM.sector=2;vectorPWM.dop=G120;}
+        else{
+          if(vectorPWM.currentPhi<G240){vectorPWM.sector=3; vectorPWM.dop=G180;}
+          else{
+            if(vectorPWM.currentPhi<G300){vectorPWM.sector=4; vectorPWM.dop=G240;}
+            else{vectorPWM.sector=5; vectorPWM.dop=G300;}         
+          }
+        }      
+      }
+    }     
+    int32_t tempInt32=vectorPWM.amplitudePWM+pidVoltage.pwmCorrection;
+    if(tempInt32>32767)tempInt32=32767;
+    else if(tempInt32<0)tempInt32=0;
+    vectorPWM.amplitudePWMcorrected=(int16_t)tempInt32;
+    
+    if(command.voltageStab) // Стабилизация напряжения + ограничение изменения напряжения на такте ШИМ
+    {       
+      if(stabState)      
+      {
+        deltaStab=vectorPWM.amplitudePWMcorrected-prevPWMstab;
+        if(deltaStab>=0)
+        {        
+          if(deltaStab>command.voltageStab)vectorPWM.amplitudePWMcorrected=prevPWMstab+command.voltageStab;
+        }else{
+          deltaStab=-deltaStab;
+          if(deltaStab>command.voltageStab)vectorPWM.amplitudePWMcorrected=prevPWMstab-command.voltageStab;
+        }                
+      }
+      prevPWMstab=vectorPWM.amplitudePWMcorrected;
+      stabState=1;
+    }else stabState=0;
+      
+    int32_t phi;
+    uint32_t temp;   
+    phi=vectorPWM.currentPhi-vectorPWM.dop;   // текущее положение внутри каждого сектора    
+    temp=2*vectorPWM.arr;//(56756*vectorPWM.arr)/32768; //56756=32768*sqrt(3)
+    temp=(temp*vectorPWM.amplitudePWMcorrected)/32768;      
+    vectorPWM.Tb2=(temp*arm_sin_q15(phi))/32768;   
+    vectorPWM.Tb1=(temp*arm_sin_q15(G60-phi))/32768;  
+    
+    
+    #define DT_2 (168*2)
+    
+    if((vectorPWM.Tb1<=DT_2)||(vectorPWM.Tb2<=DT_2))
+    {  
+      vectorPWM.To=(vectorPWM.arr2-vectorPWM.Tb1-vectorPWM.Tb2)/2; 
+    }else{  
+      vectorPWM.To=(vectorPWM.arr2-vectorPWM.Tb1-vectorPWM.Tb2); 
+    }
+    
+    vectorPWM.t1=vectorPWM.Tb1+vectorPWM.Tb2+vectorPWM.To;
+    vectorPWM.t2=vectorPWM.Tb2+vectorPWM.To;
+    vectorPWM.t3=vectorPWM.Tb1+vectorPWM.To;
+    
+    switch(vectorPWM.sector)
+    {    
+      case 0:
+        vectorPWM.cc[0]=(uint16_t)(vectorPWM.arr2-vectorPWM.t1)/2;
+        vectorPWM.cc[1]=(uint16_t)(vectorPWM.arr2-vectorPWM.t2)/2; 
+        vectorPWM.cc[2]=(uint16_t)(vectorPWM.arr2-vectorPWM.To)/2; 
+      break;    
+      case 1:
+        vectorPWM.cc[0]=(uint16_t)(vectorPWM.arr2-vectorPWM.t3)/2;
+        vectorPWM.cc[1]=(uint16_t)(vectorPWM.arr2-vectorPWM.t1)/2;
+        vectorPWM.cc[2]=(uint16_t)(vectorPWM.arr2-vectorPWM.To)/2; 
+      break;   
+      case 2:
+        vectorPWM.cc[0]=(uint16_t)(vectorPWM.arr2-vectorPWM.To)/2; 
+        vectorPWM.cc[1]=(uint16_t)(vectorPWM.arr2-vectorPWM.t1)/2; 
+        vectorPWM.cc[2]=(uint16_t)(vectorPWM.arr2-vectorPWM.t2)/2; 
+      break;    
+      case 3:
+        vectorPWM.cc[0]=(uint16_t)(vectorPWM.arr2-vectorPWM.To)/2; 
+        vectorPWM.cc[1]=(uint16_t)(vectorPWM.arr2-vectorPWM.t3)/2;
+        vectorPWM.cc[2]=(uint16_t)(vectorPWM.arr2-vectorPWM.t1)/2; 
+      break;    
+      case 4:
+        vectorPWM.cc[0]=(uint16_t)(vectorPWM.arr2-vectorPWM.t2)/2;
+        vectorPWM.cc[1]=(uint16_t)(vectorPWM.arr2-vectorPWM.To)/2;
+        vectorPWM.cc[2]=(uint16_t)(vectorPWM.arr2-vectorPWM.t1)/2;
+      break;    
+      case 5: 
+        vectorPWM.cc[0]=(uint16_t)(vectorPWM.arr2-vectorPWM.t1)/2; 
+        vectorPWM.cc[1]=(uint16_t)(vectorPWM.arr2-vectorPWM.To)/2; 
+        vectorPWM.cc[2]=(uint16_t)(vectorPWM.arr2-vectorPWM.t3)/2; 
+        break;
+    }   
+
+
+    #define edgeCur 18   // edgeCur/100 - это в амперах
+    #define ccLimL 32//102
+    #define ccLimH 8400-ccLimL//8400-102
+    
+    if((vectorPWM.cc[0]>ccLimL)&&(vectorPWM.cc[0]<ccLimH))
+    {
+      if(vectorPWM.ia>=0)
+      {   
+        if(vectorPWM.ia<edgeCur)TIM1->CCR1=vectorPWM.cc[0]-(uint16_t)((float)ccLimL*(float)vectorPWM.ia/(float)edgeCur); 
+        else TIM1->CCR1=vectorPWM.cc[0]-ccLimL; 
+      }
+      else{     
+        if((vectorPWM.ia+edgeCur)>0)TIM1->CCR1=vectorPWM.cc[0]-(int16_t)((float)ccLimL*(float)vectorPWM.ia/(float)edgeCur);
+        else TIM1->CCR1=vectorPWM.cc[0]+ccLimL;  
+      }
+    }else{TIM1->CCR1=vectorPWM.cc[0];}
+     
+    if((vectorPWM.cc[1]>ccLimL)&&(vectorPWM.cc[1]<ccLimH))
+    {  
+      if(vectorPWM.ib>=0)
+      {   
+        if(vectorPWM.ib<edgeCur)TIM1->CCR2=vectorPWM.cc[1]-(uint16_t)((float)ccLimL*(float)vectorPWM.ib/(float)edgeCur); 
+        else TIM1->CCR2=vectorPWM.cc[1]-ccLimL; 
+      }
+      else{     
+        if((vectorPWM.ib+edgeCur)>0)TIM1->CCR2=vectorPWM.cc[1]-(int16_t)((float)ccLimL*(float)vectorPWM.ib/(float)edgeCur);
+        else TIM1->CCR2=vectorPWM.cc[1]+ccLimL;  
+      }
+    }else{TIM1->CCR2=vectorPWM.cc[1];}
+    
+    if((vectorPWM.cc[2]>ccLimL)&&(vectorPWM.cc[2]<ccLimH))
+    {    
+      if(vectorPWM.ic>=0)
+      {   
+        if(vectorPWM.ic<edgeCur)TIM1->CCR3=vectorPWM.cc[2]-(uint16_t)((float)ccLimL*(float)vectorPWM.ic/(float)edgeCur); 
+        else TIM1->CCR3=vectorPWM.cc[2]-ccLimL;
+      }
+      else{     
+        if((vectorPWM.ic+edgeCur)>0)TIM1->CCR3=vectorPWM.cc[2]-(int16_t)((float)ccLimL*(float)vectorPWM.ic/(float)edgeCur);
+        else TIM1->CCR3=vectorPWM.cc[2]+ccLimL;  
+      }
+    }
+    else{TIM1->CCR3=vectorPWM.cc[2];}
+    
+    int32_t temp1;  
+    measurements.tempUa=0.000017619332f*(float)vectorPWM.amplitudePWMcorrected;//0.57735027f*vectorPWM.amplitudePWMcorrected/32768.0f;      //  3^(-0.5)~=0.57735027     
+    
+    temp1=(int32_t)vectorPWM.prevPhi;    
+    if(temp1<0)temp1=temp1+32768;
+    if(temp1>32767)temp1=temp1-32768;  
+    vectorPWM.prevPhi=temp1;
+    //-----------------------------------------------------------------------------------------------------------------
+    temp1=(int32_t)vectorPWM.prevPhi-G120;  
+    if(temp1<0)temp1=temp1+32768;  
+    measurements.tempUb=measurements.tempUa*arm_cos_q15((int16_t)temp1)/32768.0f;
+    
+    temp1=(int32_t)vectorPWM.prevPhi+G120;
+    if(temp1>32767)temp1=temp1-32768;  
+    measurements.tempUc=measurements.tempUa*arm_cos_q15((int16_t)temp1)/32768.0f;
+    
+    measurements.tempUa=measurements.tempUa*arm_cos_q15(vectorPWM.prevPhi)/32768.0f;              
+    
+    vectorPWM.prevPhi=vectorPWM.currentPhi;  
+   
+    if(command.rotationDIR)
+    {
+      if(command.testMode)
+      {
+        vectorPWM.doublePhi-=command.testModeDeltaPhi+vectorPWM.activePdPhi;
+      }else vectorPWM.doublePhi-=vectorPWM.curDeltaPhi+vectorPWM.activePdPhi;
+      
+      if(vectorPWM.doublePhi<=0.0)
+      {
+        vectorPWM.doublePhi=vectorPWM.doublePhi+1.0;
+        measurements.endOfPeriodCnt++;   
+      }      
+    }else{
+      if(command.testMode)
+      {
+        vectorPWM.doublePhi+=command.testModeDeltaPhi+vectorPWM.activePdPhi;
+      }else vectorPWM.doublePhi+=vectorPWM.curDeltaPhi+vectorPWM.activePdPhi;
+      
+      if(vectorPWM.doublePhi>=1.0)
+      {
+        vectorPWM.doublePhi=vectorPWM.doublePhi-1.0;
+        measurements.endOfPeriodCnt++;   
+      } 
+    }    
+    if(dynaGram.state==3)
+    {
+      vectorPWM.floatPhi=vectorPWM.curDeltaPhi+vectorPWM.activePdPhi;
+      dynaGram.outputVoltagePhase+=vectorPWM.floatPhi+dynaGram.slipCoeff*(float)measurements.Irms/100.0f+dynaGram.slipConst;  // Накопление фазы для снятия динамограммы 09.02.2018      
+    }
+    vectorPWM.floatPhi=(float)vectorPWM.doublePhi;
+    vectorPWM.currentPhi=(uint32_t)(vectorPWM.floatPhi*32768); 
+  }    
+}
+
+void PWM_EnableOutputs(TIM_HandleTypeDef *htim)
+{
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_1, TIM_CCx_ENABLE);
+  TIM_CCxNChannelCmd(htim->Instance, TIM_CHANNEL_1, TIM_CCxN_ENABLE);  
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_2, TIM_CCx_ENABLE);
+  TIM_CCxNChannelCmd(htim->Instance, TIM_CHANNEL_2, TIM_CCxN_ENABLE); 
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_3, TIM_CCx_ENABLE);
+  TIM_CCxNChannelCmd(htim->Instance, TIM_CHANNEL_3, TIM_CCxN_ENABLE);  
+} 
+
+void PWM_DisableOutputs(TIM_HandleTypeDef *htim)
+{
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_1, TIM_CCx_DISABLE);
+  TIM_CCxNChannelCmd(htim->Instance, TIM_CHANNEL_1, TIM_CCxN_DISABLE);  
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_2, TIM_CCx_DISABLE);
+  TIM_CCxNChannelCmd(htim->Instance, TIM_CHANNEL_2, TIM_CCxN_DISABLE); 
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_3, TIM_CCx_DISABLE);
+  TIM_CCxNChannelCmd(htim->Instance, TIM_CHANNEL_3, TIM_CCxN_DISABLE);   
+} 
+
+HAL_StatusTypeDef PWM_Start(TIM_HandleTypeDef *htim)
+{
+  __HAL_TIM_ENABLE_IT(htim, TIM_IT_CC4);
+  /*TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_1, TIM_CCx_ENABLE | TIM_CCxN_ENABLE);
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_2, TIM_CCx_ENABLE | TIM_CCxN_ENABLE);  
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_3, TIM_CCx_ENABLE | TIM_CCxN_ENABLE);  */
+  TIM_CCxChannelCmd(htim->Instance, TIM_CHANNEL_4, TIM_CCx_ENABLE);  
+  TIM1->CNT=0;  
+  /* Enable the main output */
+  __HAL_TIM_MOE_ENABLE(htim);
+  /* Enable the Peripheral */
+  __HAL_TIM_ENABLE(htim);
+  
+  /* Return function status */
+  return HAL_OK;
+} 
+
+void TIM_CCxNChannelCmd(TIM_TypeDef* TIMx, uint32_t Channel, uint32_t ChannelNState)
+{
+  uint32_t tmp = 0;
+
+  /* Check the parameters */
+  assert_param(IS_TIM_CC4_INSTANCE(TIMx));
+  assert_param(IS_TIM_COMPLEMENTARY_CHANNELS(Channel));
+
+  tmp = TIM_CCER_CC1NE << Channel;
+
+  /* Reset the CCxNE Bit */
+  TIMx->CCER &= ~tmp;
+
+  /* Set or reset the CCxNE Bit */ 
+  TIMx->CCER |= (uint32_t)(ChannelNState << Channel);
+}
+
+void switchPWMtoDO(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct;
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11 
+                        |GPIO_PIN_12|GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FAST;   
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+}
+
+void switchDOtoPWM(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct;
+  
+  GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11 
+                        |GPIO_PIN_12|GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FAST; 
+  GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+}
