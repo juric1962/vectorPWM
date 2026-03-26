@@ -1,7 +1,389 @@
-// Это комментарий на кириллице
-#include <stdio.h>
+#include "alarms.h"
+#include "pwm.h"
+#include "sram_rtc.h"
+#include "main.h"
+#include "fram.h"
+#include "bvi.h" 
 
-int main() {
-    printf("Привет, мир!");
+volatile ALARMS_STRUCT alarms, alarmsShadow;        // ������� ��������� �������, �������������, ����������� ��������� �������   
+volatile ETR_ENGINE_STRUCT etrEngine, etrEngineShadow; 
+volatile FAULT_EVENT_STRUCT *faultsArrayNVRAM;
+volatile EVENTS_COUNTER_STRUCT eventsCnt;
+
+void engineETRInit(void)
+{  
+  framRead(ETR_ENGINE_FRAM_ADDR,(uint8_t*)&etrEngine,ETR_ENGINE_FRAM_LENGTH);   
+  etrEngineShadow.updateFromShadow=0;
+  if(etrEngine.CRC16!=modBusCRC16((uint8_t*)&etrEngine,ETR_ENGINE_MODBUS_REGNUM*2)) // �������� ������ �� ���������
+  {
+    //eventLogWrite(ETR_DEFAULTS_SET,0.0f,RTC_UnixTime.timeStamp);
+    eventsCnt.etrDefaults++;
+    float tempFloat;  
+    etrEngine.Isum=0;  
+    etrEngine.IsumCnt=0;
+    etrEngine.overloadCnt=0;
+    etrEngine.overloadPercent=120;
+    etrEngine.overloadSec=60;
+    etrEngine.overloadCurrent=engine.Inom*(float)etrEngine.overloadPercent/100.0f;
+    etrEngine.overloadLimit=etrEngine.overloadCurrent*etrEngine.overloadCurrent*etrEngine.overloadSec;
+    etrEngine.externalCoolingOn=0;
+    etrEngine.isOn=0;
+
+    etrEngine.freqCorrPoints[0]=10;
+    etrEngine.freqCorrPoints[1]=30;
+    etrEngine.currentCorrPoints[0]=10;
+    etrEngine.currentCorrPoints[1]=30;
+    etrEngine.currentCorrPoints[2]=50;
+    etrEngine.currentCorrPoints[3]=70;
+    
+    tempFloat=etrEngine.freqCorrPoints[0]-engine.minFreq;
+    if(tempFloat>0.0f)etrEngine.k1=(etrEngine.currentCorrPoints[1]-etrEngine.currentCorrPoints[0])/(100.0f*tempFloat);
+    else etrEngine.k1=0;
+    etrEngine.C1=-etrEngine.k1*engine.minFreq+etrEngine.currentCorrPoints[0]/100.0f;  
+      
+    tempFloat=etrEngine.freqCorrPoints[1]-etrEngine.freqCorrPoints[0];
+    if(tempFloat>0.0f)etrEngine.k2=(etrEngine.currentCorrPoints[2]-etrEngine.currentCorrPoints[1])/(100.0f*tempFloat);
+    else etrEngine.k2=0;
+    etrEngine.C2=-etrEngine.k2*etrEngine.freqCorrPoints[0]+etrEngine.currentCorrPoints[1]/100.0f;  
+      
+    tempFloat=engine.maxFreq-etrEngine.freqCorrPoints[1];
+    if(tempFloat>0.0f)etrEngine.k3=(etrEngine.currentCorrPoints[3]-etrEngine.currentCorrPoints[2])/(100.0f*tempFloat);
+    else etrEngine.k3=0;
+    etrEngine.C3=-etrEngine.k3*etrEngine.freqCorrPoints[1]+etrEngine.currentCorrPoints[2]/100.0f;          
+  
+    etrEngine.CRC16=modBusCRC16((uint8_t*)&etrEngine, ETR_ENGINE_MODBUS_REGNUM*2);    
+    framWrite(ETR_ENGINE_FRAM_ADDR,(uint8_t*)&etrEngine,ETR_ENGINE_FRAM_LENGTH);    
+  }else{    
+    etrEngine.overloadCurrent=engine.Inom*((float)etrEngine.overloadPercent)/100.0f;
+    etrEngine.overloadLimit=etrEngine.overloadCurrent*etrEngine.overloadCurrent*((float)etrEngine.overloadSec);    
+    float tempFloat;
+    tempFloat=etrEngine.freqCorrPoints[0]-engine.minFreq;
+    if(tempFloat>0.0f)etrEngine.k1=(etrEngine.currentCorrPoints[1]-etrEngine.currentCorrPoints[0])/(100.0f*tempFloat);
+    else etrEngine.k1=0;
+    etrEngine.C1=-etrEngine.k1*engine.minFreq+etrEngine.currentCorrPoints[0]/100.0f;  
+      
+    tempFloat=etrEngine.freqCorrPoints[1]-etrEngine.freqCorrPoints[0];
+    if(tempFloat>0.0f)etrEngine.k2=(etrEngine.currentCorrPoints[2]-etrEngine.currentCorrPoints[1])/(100.0f*tempFloat);
+    else etrEngine.k2=0;
+    etrEngine.C2=-etrEngine.k2*etrEngine.freqCorrPoints[0]+etrEngine.currentCorrPoints[1]/100.0f;  
+      
+    tempFloat=engine.maxFreq-etrEngine.freqCorrPoints[1];
+    if(tempFloat>0.0f)etrEngine.k3=(etrEngine.currentCorrPoints[3]-etrEngine.currentCorrPoints[2])/(100.0f*tempFloat);
+    else etrEngine.k3=0;
+    etrEngine.C3=-etrEngine.k3*etrEngine.freqCorrPoints[1]+etrEngine.currentCorrPoints[2]/100.0f;          
+  
+    etrEngine.CRC16=modBusCRC16((uint8_t*)&etrEngine, ETR_ENGINE_MODBUS_REGNUM*2);    
+    framWrite(ETR_ENGINE_FRAM_ADDR,(uint8_t*)&etrEngine,ETR_ENGINE_FRAM_LENGTH);          
+    
+    framRead(ETR_ENGINE_FRAM_OVERLOAD_CNT_ADDR,(uint8_t*)&etrEngine.overloadCnt,ETR_ENGINE_FRAM_OVERLOAD_CNT_LENGTH);    
+    if(etrEngine.overloadCntCRC!=modBusCRC16((uint8_t*)&etrEngine.overloadCnt,4))     
+    {    
+      etrEngine.overloadCnt=0.0f;
+    }else{    
+      bkpSRAM_Read(TIMESTAMP_SRAM_ADDR,(uint8_t*)&RTC_UnixTime,TIMESTAMP_SRAM_LENGTH);        
+      if(RTC_UnixTime.CRC16==modBusCRC16((uint8_t*)&RTC_UnixTime,4))
+      {
+        HAL_RTC_GetTime(&hrtc,&RTC_TimeStructure,RTC_FORMAT_BIN);
+        HAL_RTC_GetDate(&hrtc,&RTC_DateStructure,RTC_FORMAT_BIN);       
+        uint32_t timeStamp=toUnix(RTC_DateStructure,RTC_TimeStructure);            
+        etrEngine.overloadCnt=etrEngine.overloadCnt-((float)(timeStamp-RTC_UnixTime.timeStamp))*(etrEngine.overloadCurrent*etrEngine.overloadCurrent)/10.0f;      
+        if(etrEngine.overloadCnt<0.0f)etrEngine.overloadCnt=0.0f;      
+      }
+    }
+    etrEngine.Isum=0;  
+    etrEngine.IsumCnt=0;     
+  }  
+  copymas((uint8_t*)&etrEngineShadow,(uint8_t*)&etrEngine,ETR_ENGINE_MODBUS_REGNUM*2);
+}
+
+void alarmsResetCounters(void)
+{
+  alarms.InstPhCurMaxSumA=0;
+  alarms.InstPhCurMaxSumB=0;
+  alarms.InstPhCurMaxSumC=0;
+  alarms.InstPhCurMaxCnt=0;        
+  alarms.breakCurAMinCounterMS=0;
+  alarms.breakCurBMinCounterMS=0;
+  alarms.breakCurCMinCounterMS=0;  
+  alarms.curDisbalanceMaxCounterMS=0;  
+  alarms.IrmsMaxCounter=0;  
+  alarms.noLoadWattsSecCnt=0.0f;
+}
+
+void alarmsInit(void)
+{  
+  framRead(ALARMS_FRAM_ADDR,(uint8_t*)&alarms,ALARMS_FRAM_LENGTH);  
+  if(alarms.CRC16!=modBusCRC16((uint8_t*)&alarms,ALARMS_MODBUS_REGNUM*2)) // �������� ������ �� ���������
+  {  
+    //eventLogWrite(ALARMS_DEFAULTS_SET,0.0f,RTC_UnixTime.timeStamp);
+    eventsCnt.alarmsDefaults++;
+    alarms.InstPhCurMaxPercent=200;
+    alarms.InstPhCurMaxSampNum=1;
+    alarms.IrmsMaxPercent=150;
+    alarms.IrmsMaxMS=1000;
+    alarms.breakCurMinPercent=10;
+    alarms.breakCurMinMS=3000;    
+    alarms.curDisbalanceMaxPercent=30;
+    alarms.curDisbalanceMaxMS=5000;    
+    
+    alarms.internalTemperatureMAX=60;
+    alarms.internalTemperatureNORM=55;
+    alarms.radiatorTemperatureMAX=95;
+    alarms.radiatorTemperatureNORM=75;   
+      
+    alarms.InstPhCurMax=(uint16_t)((float)alarms.InstPhCurMaxPercent*engine.Inom*1.4142136f);
+    alarms.IrmsMax=(uint16_t)((float)alarms.IrmsMaxPercent*engine.Inom);    
+    alarms.curDisbalanceMax=(uint16_t)((float)alarms.curDisbalanceMaxPercent*engine.Inom/100.0f);
+    alarms.breakCurMin=(uint16_t)((float)alarms.breakCurMinPercent*engine.Inom/100.0f);    
+    
+    alarmsResetCounters();
+    
+    /*alarms.lowVoltageFixFreq=25;
+    alarms.lowVoltageFixFreqEnable=1;
+    alarms.lowVoltageFixFreqSec=15;
+    alarms.lowVoltageOffSec=10;
+    alarms.lowVoltageFixFreqDone=0;*/
+    
+    alarms.noLoadWatts=3000;
+    alarms.noLoadWattsSec=100;
+      
+    /*alarms.lowVoltageFixFreqSecCnt=0.0f;
+    alarms.lowVoltageUnFixFreqSecCnt=0.0f;    
+    alarms.lowVoltageOffSecCnt=0.0f;       
+    alarms.noLoadWattsSecCnt=0.0f; */
+    
+    alarms.curDisbalanceMaxRecoverCntLimit=3;    
+    alarms.IrmsMaxRecoverCntLimit=3;    
+    alarms.noLoadWattsRecoverCntLimit=3;
+    alarms.lowVoltageRecoveryCntLimit=3;
+    alarms.temperatureRecoveryCntLimit=3;
+    alarms.etrRecoveryCntLimit=3;
+    alarms.highVoltageOffRecoverCntLimit=3; 
+    
+    //alarms.bridgeSaturationResetCnt=300;
+    //alarms.InstPhCurMaxResetCnt=300;
+    //alarms.IrmsMaxResetCnt=300;
+    //alarms.breakCurMinResetCnt=300;
+    //alarms.curDisbalanceMaxResetCnt=300;
+    //alarms.lowVoltageOffResetCnt=300;
+    //alarms.highVoltageOffResetCnt=300;
+    //alarms.noLoadWattsResetCnt=300;
+    
+    alarms.faultBits=0; 
+    alarms.faultBitsExtended=0;
+    alarms.CRC16=modBusCRC16((uint8_t*)&alarms, ALARMS_MODBUS_REGNUM*2);    
+    framWrite(ALARMS_FRAM_ADDR,(uint8_t*)&alarms,ALARMS_FRAM_LENGTH);     
+  }  
+  copymas((uint8_t*)&alarmsShadow,(uint8_t*)&alarms,ALARMS_MODBUS_REGNUM*2);
+  alarms.InstPhCurMax=(uint16_t)((float)alarms.InstPhCurMaxPercent*engine.Inom*1.4142136f);
+  alarms.IrmsMax=(uint16_t)((float)alarms.IrmsMaxPercent*engine.Inom);  
+  alarms.curDisbalanceMax=(uint16_t)((float)alarms.curDisbalanceMaxPercent*engine.Inom/100.0f);
+  alarms.breakCurMin=(uint16_t)((float)alarms.breakCurMinPercent*engine.Inom/100.0f);   
+  alarmsResetCounters();    
+  engineETRInit();
+}
+
+void getFaultBits(void)
+{ 
+  alarms.faultBits|=0x0007;
+  //alarms.faultBits|=(uint8_t)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_0);      // FAULT_A_HI    
+  //alarms.faultBits|=((uint8_t)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_2)<<1); // FAULT_B_HI    
+  //alarms.faultBits|=((uint8_t)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_4)<<2); // FAULT_C_HI   
+  //alarms.faultBitsExtended|=((uint8_t)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_1)<<2); // FAULT_A_LO  
+  //alarms.faultBitsExtended|=((uint8_t)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_3)<<3); // FAULT_B_LO  
+  //alarms.faultBitsExtended|=((uint8_t)HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_5)<<4); // FAULT_C_LO  
+}
+
+float freqCorrection(float freq)
+{
+  float value;  
+  if(freq>=etrEngine.freqCorrPoints[1]) 
+  {  
+    if(freq>=engine.maxFreq)value=engine.maxFreq;
+    else value=etrEngine.k3*freq+etrEngine.C3;   
+  }else if(freq>=etrEngine.freqCorrPoints[0])
+        {    
+          value=etrEngine.k2*freq+etrEngine.C2;
+        }else if(freq>=engine.minFreq)
+              {
+                value=etrEngine.k1*freq+etrEngine.C1;    
+              }else value=engine.minFreq;
+   
+  if(value>1.0f)value=1.0f;
+  if(value<=0.01f)value=1.0f;
+  
+  return value;
+}
+
+uint32_t faultsInit(void) // ������������� ������� ���, ����������, ����� �������� �� ��������� �� ����� .maxCnt � .recoverCntSec
+{                         // ��������� � ���������������� ������ *RecoverCntLimit � *ResetCnt !!!!                                 
+  uint8_t i;              // �������� ����� ����������, �� ����� ������� ���������� ������� �����������
+  uint32_t state=0;  
+  faultsArrayNVRAM=(volatile FAULT_EVENT_STRUCT*)((volatile uint8_t*)(BKPSRAM_BASE+FAULT_ARRAY_ADDR));//(volatile FAULT_EVENT_STRUCT*)(BKPSRAM_BASE+FAULT_ARRAY_ADDR);
+  for(i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+  {
+    if(faultsArrayNVRAM[i].CRC16==modBusCRC16((uint8_t*)&faultsArrayNVRAM[i],10))
+    {           
+      if(faultsArrayNVRAM[i].upCnt)
+      { 
+        if(faultsArrayNVRAM[i].maxCnt) // ���� ������� ���=0 - �� �� ����������� ���� ����� ������
+        {
+          if(faultsArrayNVRAM[i].upCnt>=faultsArrayNVRAM[i].maxCnt)
+          {
+            state|=1L<<i;   
+            forceBVI(i, 1);
+          }/*else{
+            forceBVI(i, 3);
+          }*/
+        }/*else{
+          forceBVI(i, 3);
+        }*/
+      }      
+    }else{        
+      switch(i)
+      {
+        case NO_LOAD_FAULT:
+          faultsArrayNVRAM[i].upCnt=0;      
+          //faultsArrayNVRAM[i].recoverCntSec=alarms.noLoadWattsResetCnt;
+          faultsArrayNVRAM[i].maxCnt=alarms.noLoadWattsRecoverCntLimit;          
+        break;
+        case LOW_VOLTAGE_FAULT:
+          faultsArrayNVRAM[i].upCnt=0;      
+          //faultsArrayNVRAM[i].recoverCntSec=alarms.lowVoltageOffRecoverCntLimit;
+          faultsArrayNVRAM[i].maxCnt=alarms.lowVoltageRecoveryCntLimit;                    
+        break;
+        case TEMP_SENS_FAULT:
+          faultsArrayNVRAM[i].upCnt=0;      
+          faultsArrayNVRAM[i].maxCnt=alarms.temperatureRecoveryCntLimit;          
+        break;
+        case BREAK_PHASE_CURRENT_FAULT:
+          faultsArrayNVRAM[i].upCnt=0; 
+          //faultsArrayNVRAM[i].recoverCntSec=alarms.breakCurMinResetCnt;          
+          faultsArrayNVRAM[i].maxCnt=alarms.curDisbalanceMaxRecoverCntLimit;                    
+        break;
+        case ETR_OVERLOAD_FAULT:
+          faultsArrayNVRAM[i].upCnt=0;      
+          faultsArrayNVRAM[i].maxCnt=alarms.etrRecoveryCntLimit;                    
+        break;
+        case UDC_OVERVOLTAGE_FAULT:
+          faultsArrayNVRAM[i].upCnt=0;  
+          //faultsArrayNVRAM[i].recoverCntSec=alarms.highVoltageOffRecoverCntLimit;          
+          faultsArrayNVRAM[i].maxCnt=alarms.highVoltageOffRecoverCntLimit;                    
+        break;
+        case BRIDGE_SATURATION_FAULT:
+          faultsArrayNVRAM[i].upCnt=0;      
+          //faultsArrayNVRAM[i].recoverCntSec=alarms.bridgeSaturationResetCnt;          
+          faultsArrayNVRAM[i].maxCnt=alarms.IrmsMaxRecoverCntLimit;                    
+        break;      
+      }                
+      //eventLogWrite(FAULTS_DEFAULTS_SET,0.0f,RTC_UnixTime.timeStamp);      
+      faultsArrayNVRAM[i].CRC16=modBusCRC16((uint8_t*)&faultsArrayNVRAM[i],FAULT_ARRAY_ITEM_SIZE-2);  
+      eventsCnt.faultsDefaults++;
+    }    
+  }
+  return state;
+}
+
+uint8_t faultCountersUpdate(uint8_t num) // �������� ��������� ��������� ������, � ������ recoverCntSec
+{
+  //uint32_t timeDiff;
+  uint8_t status=0;
+  /*
+  if(faultsArrayNVRAM[num].upCnt) // �������������, ������ ���� ���� ������, ����� ������ ����������������, ������� �� ��� �����...
+  {
+    timeDiff=RTC_UnixTime.timeStamp-faultsArrayNVRAM[num].recoverTime;
+    if(timeDiff)
+    {
+      timeDiff=timeDiff/faultsArrayNVRAM[num].recoverCntSec;
+      if(timeDiff) // ������ ���������� ������� ��� ����������������� ��������� ������
+      {
+        if(timeDiff>faultsArrayNVRAM[num].upCnt)faultsArrayNVRAM[num].upCnt=0;
+        else faultsArrayNVRAM[num].upCnt=faultsArrayNVRAM[num].upCnt-timeDiff;        
+        faultsArrayNVRAM[num].CRC16=modBusCRC16((uint8_t*)&faultsArrayNVRAM[num],10);        
+        //framWrite(FAULTS_FRAM_ADDR+12*num,(uint8_t*)&faultsArrayNVRAM[num],12);        
+      }
+    }
+    if(faultsArrayNVRAM[num].upCnt>=faultsArrayNVRAM[num].maxCnt)status++;   
+  }*/
+  return status;
+}
+
+uint8_t faultEventAdd(uint8_t num) // �������� �������, ���� ������� ���������� �� ����, �� ��������� ���������, 
+{                                  // ���������� ������ � ���� ����� ������ ����� ������ ������ ��� ������������ �������� "����/����." ��� ����� ������                            
+  //faultCountersUpdate(num);
+  faultsArrayNVRAM[num].upCnt++;  
+  faultsArrayNVRAM[num].CRC16=modBusCRC16((uint8_t*)&faultsArrayNVRAM[num],FAULT_ARRAY_ITEM_SIZE-2);
+  if(faultsArrayNVRAM[num].maxCnt)
+  {
+    if(faultsArrayNVRAM[num].upCnt>=faultsArrayNVRAM[num].maxCnt)
+    {    
+      return 1;
+    }else{    
+      //faultsArrayNVRAM[num].recoverTime=RTC_UnixTime.timeStamp;       
+      return 0;
+    }  
+  }else{
     return 0;
+  }    
+}
+
+void faultCountersReset(void)
+{
+  uint8_t i;
+  for(i=0;i<FAULT_ARRAY_ITEMS_NUM;i++)
+  {      
+    faultsArrayNVRAM[i].upCnt=0; // �������� ������� ������ 
+    faultsArrayNVRAM[i].CRC16=modBusCRC16((uint8_t*)&faultsArrayNVRAM[i],FAULT_ARRAY_ITEM_SIZE-2);        
+  }   
+  systemState.startDisable=0;
+  systemState.faults=0;
+  for(int i=0;i<10;i++)forceBVI(i, 0);
+  forceBVI(8, 7);
+  alarms.faultBits=0;
+  alarms.faultBitsExtended=0; 
+  FAULT_OPTO_OUT(0);
+  //LED2_RED(0);
+}
+
+void eventsCntInit(void)
+{  
+  framRead(EVENTS_COUNTER_FRAM_ADDR,(uint8_t*)&eventsCnt,EVENTS_COUNTER_FRAM_LENGTH);  
+  if(eventsCnt.CRC16!=modBusCRC16((uint8_t*)&eventsCnt,EVENTS_COUNTER_MODBUS_REGNUM*2)) // �������� ������ �� ���������
+  {  
+    eventsCnt.satA=0;
+    eventsCnt.satB=0;
+    eventsCnt.satC=0;
+    eventsCnt.overVoltage=0;
+    eventsCnt.instA=0;
+    eventsCnt.instB=0;
+    eventsCnt.instC=0;
+    eventsCnt.rms=0;
+    eventsCnt.etr=0;
+    eventsCnt.breakA=0;
+    eventsCnt.breakB=0;
+    eventsCnt.breakC=0;    
+    eventsCnt.disbalance=0;
+    eventsCnt.temp1=0;
+    eventsCnt.temp2=0;
+    eventsCnt.lowVoltage=0;
+    eventsCnt.noLoad=0;   
+    eventsCnt.adc_pwm_err=0;
+    eventsCnt.adc_energy_err=0;    
+    eventsCnt.eventsCntDefaults=1;
+    eventsCnt.etrDefaults=0;
+    eventsCnt.alarmsDefaults=0;
+    eventsCnt.faultsDefaults=0;
+    eventsCnt.commandDefaults=0;
+    eventsCnt.contextDefaults=0;
+    eventsCnt.adcDefaults=0;
+    eventsCnt.dacDefaults=0;
+    eventsCnt.engineDefaults=0;
+    eventsCnt.HSE_init_err=0;
+    eventsCnt.RTC_init_err=0;
+    eventsCnt.iwdg=0;    
+    eventsCnt.iwdgDelayMS=0;
+    eventsCnt.CRC16=modBusCRC16((uint8_t*)&eventsCnt,EVENTS_COUNTER_MODBUS_REGNUM*2);
+    framWrite(EVENTS_COUNTER_FRAM_ADDR,(uint8_t*)&eventsCnt,EVENTS_COUNTER_FRAM_LENGTH);      
+  }  
+  eventsCnt.refresh=0;
 }
